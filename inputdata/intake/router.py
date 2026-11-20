@@ -1,6 +1,8 @@
 # app/inputdata/intake/router.py
 """문제지 업로드 → AI 정리 → 승인 후 등록 API."""
+import logging
 import os
+import shutil
 import tempfile
 from typing import Annotated, List, Optional
 
@@ -13,6 +15,7 @@ import asyncio
 from app.database import get_db
 from app.security.security import get_current_user
 from . import config, parsing, service
+from .checks import pipeline
 from .models import ALL_STATUS, EDITABLE, REGISTERED, SKIPPED, DUPLICATE, IntakeItem, IntakeJob
 
 router = APIRouter(prefix="/intake", tags=["intake"])
@@ -38,34 +41,55 @@ async def _item(db, item_id, uid):
     return it
 
 
+def _cleanup(blobs):
+    """_read_uploads 가 만든 임시 폴더를 지운다."""
+    for b in blobs or []:
+        if isinstance(b[2], str):
+            shutil.rmtree(os.path.dirname(b[2]), ignore_errors=True); return
+
+
 async def _read_uploads(files):
-    """올린 파일을 검사해 (표 위치, 원본 위치, [(이름, 확장자, 내용)]) 로. 작업 생성과 미리보기가 함께 쓴다."""
+    """올린 파일을 검사해 (표 위치, 원본 위치, [(이름, 확장자, 임시 파일 경로)]) 로. 작업 생성과 미리보기가 함께 쓴다.
+    파일을 메모리에 통째로 읽지 않고 1MB 씩 임시 파일로 옮겨 쓴다(파일 3개가 한꺼번에 메모리를 차지하지 않음). 끝나면 _cleanup(blobs)."""
     if not files: raise HTTPException(status_code=400, detail="파일을 올려 주세요.")
     if len(files) > config.max_files(): raise HTTPException(status_code=400, detail=f"한 번에 최대 {config.max_files()}개 파일까지 올릴 수 있습니다.")
     tables, originals, blobs = [], [], []
-    for f in files:
-        k = parsing.kind_of(f.filename or "")
-        if not k:
-            raise HTTPException(status_code=400, detail=f"지원하지 않는 파일 형식입니다: {os.path.basename(f.filename or '')} (표 .xlsx/.csv/.db(SQLite), 원본 .pdf/.docx/.pptx/.hwp/.hwpx/.txt/.md)")
-        data = await f.read(config.max_file_bytes() + 1)
-        if len(data) > config.max_file_bytes(): raise HTTPException(status_code=413, detail=f"파일이 너무 큽니다. (최대 {config.max_file_bytes() // 1024 // 1024}MB)")
-        if not data: raise HTTPException(status_code=400, detail=f"빈 파일입니다: {os.path.basename(f.filename or '')}")
-        (tables if k == "table" else originals).append(len(blobs)); blobs.append((os.path.basename(f.filename), os.path.splitext(f.filename)[1].lower(), data))
+    d = tempfile.mkdtemp(prefix="intake_")
+    try:
+        for f in files:
+            k = parsing.kind_of(f.filename or "")
+            if not k:
+                raise HTTPException(status_code=400, detail=f"지원하지 않는 파일 형식입니다: {os.path.basename(f.filename or '')} (표 .xlsx/.csv/.db(SQLite), 원본 .pdf/.docx/.pptx/.hwp/.hwpx/.txt/.md)")
+            ext = os.path.splitext(f.filename)[1].lower()
+            path = os.path.join(d, f"f{len(blobs)}{ext}"); size = 0
+            with open(path, "wb") as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk: break
+                    size += len(chunk)
+                    if size > config.max_file_bytes(): raise HTTPException(status_code=413, detail=f"파일이 너무 큽니다. (최대 {config.max_file_bytes() // 1024 // 1024}MB)")
+                    out.write(chunk)
+            if not size: raise HTTPException(status_code=400, detail=f"빈 파일입니다: {os.path.basename(f.filename or '')}")
+            (tables if k == "table" else originals).append(len(blobs)); blobs.append((os.path.basename(f.filename), ext, path))
+    except BaseException:
+        shutil.rmtree(d, ignore_errors=True); raise
     return tables, originals, blobs
 
 
-async def _parse_uploads(tables, originals, blobs, pattern):
-    """(입력 종류, 문제 레코드 목록). 사용자가 고칠 수 있는 입력 문제는 422 로."""
+async def _parse_uploads(tables, originals, blobs, pattern, warnings=None):
+    """(입력 종류, 문제 레코드 목록): 미리보기용. 사용자가 고칠 수 있는 입력 문제는 422 로. 읽지 못한 파일(다른 파일은 처리됨)은 warnings 목록에 안내를 더한다."""
     def parse():
-        with tempfile.TemporaryDirectory() as d:                 # 업로드 원본은 파싱 후 바로 지운다 (저장하지 않음)
-            paths = []
-            for i, (_, ext, data) in enumerate(blobs):
-                p = os.path.join(d, f"f{i}{ext}"); open(p, "wb").write(data); paths.append(p)
-            return parsing.build_records([paths[i] for i in tables], [paths[i] for i in originals], pattern, [blobs[i][0] for i in originals], table_labels=[blobs[i][0] for i in tables])
+        paths = [b[2] for b in blobs]
+        kind, recs, errs = parsing.build_records_per_file([paths[i] for i in tables], [paths[i] for i in originals], pattern, [blobs[i][0] for i in originals], table_labels=[blobs[i][0] for i in tables])
+        if warnings is not None: warnings.extend(f"읽지 못한 파일이 있어 건너뛰었습니다. {e}" for e in errs)
+        return kind, recs
+    await pipeline.PARSE_GATE.enter()                             # 파일 읽기가 한꺼번에 몰리지 않게 차례를 기다린다 (거절하지 않음)
     try:
         return await asyncio.to_thread(parse)
     except parsing.IntakeInputError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    finally:
+        pipeline.PARSE_GATE.leave()
 
 
 @router.post("/preview")
@@ -73,7 +97,10 @@ async def preview(current_user: Annotated[dict, Depends(get_current_user)], file
     """AI 를 부르지 않고 파일을 문제로 나눈 결과만 보여 준다 (문제 수, 경계, 그림, 이상 징후). 작업을 만들지 않고 아무것도 저장하지 않는다."""
     _uid(current_user)
     tables, originals, blobs = await _read_uploads(files)
-    kind, records = await _parse_uploads(tables, originals, blobs, pattern)
+    try:
+        kind, records = await _parse_uploads(tables, originals, blobs, pattern)
+    finally:
+        _cleanup(blobs)                                              # 임시 파일은 읽고 바로 지운다
     return parsing.preview_of(kind, records)
 
 
@@ -83,53 +110,107 @@ async def create_job(background_tasks: BackgroundTasks, current_user: Annotated[
                      pattern: Optional[str] = Form(None), db: AsyncSession = Depends(get_db)):
     """엑셀(표) 하나 + 원본(PDF·워드·한글·txt·md) 여러 개 중 하나 이상을 올린다. 둘 다 올리면 서로 대조한다."""
     uid = _uid(current_user)
-    tables, originals, blobs = await _read_uploads(files)
-    if await service.active_job(db, uid): raise HTTPException(status_code=409, detail="처리 중인 작업이 있습니다. 끝난 뒤에 올려 주세요.")
-    if mode not in ("none", "space", "regex", "hard", "exact", "partial", "soft"):
-        raise HTTPException(status_code=400, detail="채점 모드 값이 올바르지 않습니다.")
-    kind, records = await _parse_uploads(tables, originals, blobs, pattern)
-    if len(records) > config.max_problems():
-        raise HTTPException(status_code=413, detail=f"문제가 {len(records)}개입니다. 한 번에 최대 {config.max_problems()}개까지 처리할 수 있으니 나눠서 올려 주세요.")
-    jobs_used, problems_used = await service.daily_usage(db, uid)
-    if config.daily_jobs() and jobs_used >= config.daily_jobs():
-        raise HTTPException(status_code=429, detail=f"오늘 올릴 수 있는 작업 수({config.daily_jobs()}개)를 모두 사용했습니다. 내일 다시 올려 주세요.")
-    if config.daily_problems() and problems_used + len(records) > config.daily_problems():
-        raise HTTPException(status_code=429, detail=f"오늘 처리할 수 있는 문제 수({config.daily_problems()}개)를 넘습니다. 오늘 이미 {problems_used}개를 올렸고 이번에 {len(records)}개입니다. 나눠서 내일 올려 주세요.")
-    skipped = sorted({m.split(": ", 1)[1] for r in records for m in ((r.get("intake") or {}).get("메모") or []) if m.startswith("인식하지 못해 무시한 열: ")})
-    job_id = await service.create_job(db, uid, kind, [b[0] for b in blobs], records, mode, auto_register)
-    background_tasks.add_task(service.process_job, job_id)
-    background_tasks.add_task(service.capture_job, job_id, [b for i, b in enumerate(blobs) if i in originals], records)       # 원본 캡처는 AI 처리와 따로
-    return {"job_id": job_id, "status": "processing", "input_kind": kind, "records_total": len(records),
-            "warnings": [f"엑셀 열을 인식하지 못해 값이 AI 에게 전달되지 않았습니다: {c}" for c in skipped],
-            "message": "처리를 시작했습니다. GET /intake/jobs/{job_id} 로 진행 상황을 확인하세요."}
+    tables, originals, blobs = await _read_uploads(files)                # 임시 파일로 받는다 (메모리에 올리지 않음)
+    scheduled = False
+    try:
+        if await service.active_job(db, uid): raise HTTPException(status_code=409, detail="처리 중인 작업이 있습니다. 끝난 뒤에 올려 주세요.")
+        if mode not in ("none", "space", "regex", "hard", "exact", "partial", "soft"):
+            raise HTTPException(status_code=400, detail="채점 모드 값이 올바르지 않습니다.")
+        jobs_used, problems_used = await service.daily_usage(db, uid)
+        paths = [b[2] for b in blobs]
+        errs = []
+        gen = parsing.iter_units([paths[i] for i in tables], [paths[i] for i in originals], pattern, [blobs[i][0] for i in originals], table_labels=[blobs[i][0] for i in tables], errors=errs)
+        jobs, dups, rejected, entries, seen_h = [], [], [], [], {}
+        added, total_records, skipped_cols = 0, 0, set()
+        await pipeline.PARSE_GATE.enter()                                # 파일 읽기가 한꺼번에 몰리지 않게 차례를 기다린다 (거절하지 않음)
+        try:
+            while True:                                                  # 묶음(파일)을 하나씩 읽어 저장하고 버린 뒤 다음을 읽는다 (읽기를 나눠서 한다)
+                try:
+                    u = await asyncio.to_thread(next, gen, None)
+                except parsing.IntakeInputError as e:
+                    raise HTTPException(status_code=422, detail=str(e))
+                except Exception as e:                                    # 예상 밖 오류: 이미 만든 작업은 그대로 처리하고 안내만 남긴다
+                    logging.getLogger(__name__).exception("파일 읽기 실패")
+                    errs.append(f"파일을 읽는 중 오류가 났습니다 ({type(e).__name__})"); break
+                if u is None: break
+                recs = u["records"]
+                h = parsing.unit_hash(u)
+                same = seen_h.get(h) or await service.find_same_content(db, uid, h)
+                if same:                                                 # 이미 올린 내용과 같은 파일은 다시 만들지 않고 '이미 존재함'으로 알린다
+                    dups.append({"files": u["files"], "message": "이미 올린 파일입니다(같은 내용).", "existing_job_id": same["job_id"], "existing_status": same["status"], "uploaded_at": same.get("created_at")})
+                    continue
+                est = sum(int(r.get("생성수") or 1) for r in recs)       # 강의자료는 만들어질 문제 수로 센다
+                if len(recs) > config.max_problems():
+                    rejected.append((413, f"{', '.join(u['files'])}: 문제가 {len(recs)}개입니다. 한 번에 최대 {config.max_problems()}개까지 처리할 수 있으니 나눠서 올려 주세요.")); continue
+                if config.daily_jobs() and jobs_used + len(jobs) + 1 > config.daily_jobs():
+                    rejected.append((429, f"오늘 올릴 수 있는 작업 수({config.daily_jobs()}개)를 넘습니다. 파일마다 작업이 하나씩 만들어지며 오늘 이미 {jobs_used}개를 사용했습니다. 내일 다시 올려 주세요.")); continue
+                if config.daily_problems() and problems_used + added + est > config.daily_problems():
+                    rejected.append((429, f"오늘 처리할 수 있는 문제 수({config.daily_problems()}개)를 넘습니다. 오늘 이미 {problems_used + added}개를 올렸고 {', '.join(u['files'])} 는 {est}개입니다. 나눠서 내일 올려 주세요.")); continue
+                for r in recs:
+                    for m in ((r.get("intake") or {}).get("메모") or []):
+                        if m.startswith("인식하지 못해 무시한 열: "): skipped_cols.add(m.split(": ", 1)[1])
+                st = "processing" if not jobs else "queued"
+                jid = await service.create_job(db, uid, u["kind"], u["files"], recs, mode, auto_register, status=st, content_hash=h, problems=est)
+                seen_h[h] = {"job_id": jid, "status": st}
+                jobs.append({"job_id": jid, "files": u["files"], "status": st, "input_kind": u["kind"], "records_total": len(recs)})
+                entries.append((jid, [blobs[originals[k]] for k in u["original_idx"]]))
+                added += est; total_records += len(recs)
+                del u, recs                                              # 이 묶음의 레코드(그림 포함)는 저장했으니 버린다
+        finally:
+            pipeline.PARSE_GATE.leave()
+        if not jobs:
+            if dups and not rejected: raise HTTPException(status_code=409, detail="이미 올린 파일입니다: " + ", ".join(", ".join(d["files"]) + f" (작업 {d['existing_job_id']})" for d in dups))
+            if rejected: raise HTTPException(status_code=rejected[0][0], detail=rejected[0][1])
+            raise HTTPException(status_code=422, detail="; ".join(errs) or "처리할 문제를 찾지 못했습니다.")
+        background_tasks.add_task(service.process_queue, [j["job_id"] for j in jobs])
+        background_tasks.add_task(service.capture_jobs, entries, os.path.dirname(blobs[0][2]))        # 원본 캡처는 AI 처리와 따로 (임시 폴더는 캡처가 끝나면 지움)
+        scheduled = True
+        parse_warns = [f"읽지 못한 파일이 있어 건너뛰었습니다. {e}" for e in errs] + [f"한도 때문에 건너뛰었습니다. {d}" for _, d in rejected]
+        return {"job_id": jobs[0]["job_id"], "status": "processing", "input_kind": jobs[0]["input_kind"], "records_total": total_records, "jobs": jobs, "duplicates": dups,
+                "warnings": [f"이미 올린 파일이라 건너뛰었습니다: {', '.join(d['files'])} (작업 {d['existing_job_id']})" for d in dups] + [f"엑셀 열을 인식하지 못해 값이 AI 에게 전달되지 않았습니다: {c}" for c in sorted(skipped_cols)] + parse_warns,
+                "message": f"파일 {len(jobs)}개를 하나씩 차례로 처리합니다(파일마다 작업이 하나씩 만들어짐). 끝난 작업부터 GET /intake/jobs/{{job_id}} 와 /items 로 결과를 볼 수 있고, 기다리는 작업은 status 가 queued 입니다."}
+    finally:
+        if not scheduled: _cleanup(blobs)
 
 
 @router.get("/jobs")
-async def list_jobs(current_user: Annotated[dict, Depends(get_current_user)], limit: int = Query(20, ge=1, le=100), db: AsyncSession = Depends(get_db)):
+async def list_jobs(background_tasks: BackgroundTasks, current_user: Annotated[dict, Depends(get_current_user)], limit: int = Query(20, ge=1, le=100), db: AsyncSession = Depends(get_db)):
     uid = _uid(current_user)
+    ids = await service.recover_stalled(db, uid)                        # 서버가 재시작되어 멈춘 작업이 있으면 조회하는 김에 자동으로 이어서 처리한다
+    if ids: background_tasks.add_task(service.process_queue, ids)
     jobs = (await db.execute(select(IntakeJob).where(IntakeJob.maker_id == uid).order_by(IntakeJob.created_at.desc()).limit(limit))).scalars().all()
     return [await service.job_summary(db, j) for j in jobs]
 
 
 @router.get("/jobs/{job_id}")
-async def get_job(job_id: str, current_user: Annotated[dict, Depends(get_current_user)], db: AsyncSession = Depends(get_db)):
-    return await service.job_summary(db, await _job(db, job_id, _uid(current_user)))
+async def get_job(job_id: str, background_tasks: BackgroundTasks, current_user: Annotated[dict, Depends(get_current_user)], db: AsyncSession = Depends(get_db)):
+    uid = _uid(current_user)
+    await _job(db, job_id, uid)
+    ids = await service.recover_stalled(db, uid)                        # 서버가 재시작되어 멈춘 작업이 있으면 조회하는 김에 자동으로 이어서 처리한다
+    if ids: background_tasks.add_task(service.process_queue, ids)
+    return await service.job_summary(db, await _job(db, job_id, uid))
 
 
 @router.get("/jobs/{job_id}/items")
 async def list_items(job_id: str, current_user: Annotated[dict, Depends(get_current_user)], status: Optional[str] = Query(None),
                      limit: int = Query(200, ge=1, le=200), offset: int = Query(0, ge=0), with_record: bool = False,
+                     file: Optional[str] = Query(None, description="파일 이름. 그 파일의 문제만 (파일마다 결과를 따로 볼 때)"),
                      db: AsyncSession = Depends(get_db), ai_filled: bool = Query(False, description="true 면 AI 가 직접 푼 정답이 들어 있는 항목만 (등록 뒤 사후 점검용)")):
-    await _job(db, job_id, _uid(current_user))
+    job = await _job(db, job_id, _uid(current_user))
+    plan = (job.options or {}).get("files") or []
     if status and status not in ALL_STATUS: raise HTTPException(status_code=400, detail=f"status 는 {', '.join(ALL_STATUS)} 중 하나여야 합니다.")
     q = select(IntakeItem).where(IntakeItem.job_id == job_id)
+    if file:
+        rng = next((f for f in plan if f["name"] == file), None)
+        if rng is None: raise HTTPException(status_code=404, detail="그 이름의 파일이 이 작업에 없습니다.")
+        q = q.where(IntakeItem.seq.between(rng["from"], rng["to"]))
     if status: q = q.where(IntakeItem.status == status)
     q = q.order_by(IntakeItem.seq, IntakeItem.out_index)
     if ai_filled:                                             # JSON 안의 값이라 DB 에서 거르지 않고 가져와서 거른다 (작업당 최대 200문제)
         items = [i for i in (await db.execute(q)).scalars().all() if service.ai_filled(i.review)][offset:offset + limit]
     else:
         items = (await db.execute(q.limit(limit).offset(offset))).scalars().all()
-    return [service.item_out(i, with_record) for i in items]
+    return [service.item_out(i, with_record, plan) for i in items]
 
 
 class ApproveItem(BaseModel):
@@ -162,7 +243,7 @@ async def approve(job_id: str, body: ApproveRequest, current_user: Annotated[dic
 async def delete_job(job_id: str, current_user: Annotated[dict, Depends(get_current_user)], db: AsyncSession = Depends(get_db)):
     """작업 데이터(작업·항목·캡처)를 지운다. 등록된 문제는 그대로다. 처리 중인 작업은 지울 수 없다."""
     job = await _job(db, job_id, _uid(current_user))
-    if job.status == "processing" and service._alive(job): raise HTTPException(status_code=409, detail="처리 중인 작업은 지울 수 없습니다.")
+    if job.status in ("processing", "queued") and service._alive(job): raise HTTPException(status_code=409, detail="처리 중인 작업은 지울 수 없습니다.")
     await service.delete_jobs(db, [job_id])
     return {"job_id": job_id, "deleted": True}
 
@@ -171,7 +252,7 @@ async def delete_job(job_id: str, current_user: Annotated[dict, Depends(get_curr
 async def resume(job_id: str, background_tasks: BackgroundTasks, current_user: Annotated[dict, Depends(get_current_user)], db: AsyncSession = Depends(get_db)):
     uid = _uid(current_user)
     job = await _job(db, job_id, uid)
-    if job.status == "processing" and service._alive(job): raise HTTPException(status_code=409, detail="아직 처리 중입니다.")   # paused·failed·done 은 heartbeat 가 남아 있어도 돌고 있지 않다
+    if job.status in ("processing", "queued") and service._alive(job): raise HTTPException(status_code=409, detail="아직 처리 중이거나 차례를 기다리는 중입니다.")   # paused·failed·done 은 heartbeat 가 남아 있어도 돌고 있지 않다
     other = await service.active_job(db, uid)
     if other and other.job_id != job_id: raise HTTPException(status_code=409, detail="다른 작업이 처리 중입니다.")
     n = await service.reset_failed(db, job_id)

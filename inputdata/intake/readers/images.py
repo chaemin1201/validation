@@ -5,8 +5,20 @@ MAX_IMAGES = 8                 # 한 문제에 붙일 그림 수
 MAX_SIDE = 1600                # 긴 변 픽셀 (글자를 읽을 수 있는 크기)
 MAX_BYTES = 1_200_000          # 그림 하나의 크기
 MAX_TOTAL = 4_000_000          # 한 문제에 붙이는 그림 전체 크기
-MAX_PIXELS = 50_000_000         # 이보다 큰 그림은 열지 않는다 (작은 파일이 풀리면 거대해지는 그림 폭탄 방지)
+MAX_PIXELS = 30_000_000         # 이보다 큰 그림은 열지 않는다 (작은 파일이 풀리면 거대해지는 그림 폭탄 방지. 3천만 픽셀 = 풀면 약 90MB)
+RAW_MAX = 10_000_000            # 문서에서 꺼내 둘 그림 하나의 원본 크기 (이보다 크면 메모리에 두지 않고 건너뜀)
+RAW_TOTAL = 80_000_000          # 문서 하나에서 꺼내 두는 그림 원본의 합계 (넘으면 나머지는 건너뜀)
 JOB_BUDGET = 60_000_000         # 한 작업의 모든 문제에 붙이는 그림 전체 크기(글자 수). DB 에 같이 저장되므로 제한한다. INTAKE_MAX_JOB_IMAGE_MB 로 바꾼다
+
+
+class RawBudget:
+    """문서에서 그림 원본을 꺼내 메모리에 둘 때의 한도 (그림이 수백 장인 문서가 메모리를 한꺼번에 채우지 않게). take(크기) 가 True 면 꺼낸다."""
+    def __init__(self): self.used = 0; self.skipped = 0
+
+    def take(self, size):
+        if size is None or size > RAW_MAX or self.used + size > RAW_TOTAL:
+            self.skipped += 1; return False
+        self.used += size; return True
 
 
 def sniff(b):
@@ -15,6 +27,8 @@ def sniff(b):
     if b[:4] == b"RIFF" and b[8:12] == b"WEBP": return "image/webp"
     if b[:6] in (b"GIF87a", b"GIF89a"): return "image/gif"
     if b[:2] == b"BM": return "image/bmp"
+    if b[:4] in (b"II*\x00", b"MM\x00*"): return "image/tiff"                  # PIL 로 PNG 로 바꿔서 붙인다
+    if b[40:44] == b" EMF" or b[:4] == b"\xd7\xcd\xc6\x9a": return "image/emf"  # 윈도우 서버에서만 열린다. 못 열면 안내만 남는다
     return None
 
 
@@ -28,8 +42,11 @@ def prepare(blob):
         Image.MAX_IMAGE_PIXELS = MAX_PIXELS
     except ImportError:
         return (mime, blob) if mime in ("image/png", "image/jpeg", "image/webp") and len(blob) <= MAX_BYTES else None
+    im = None
     try:
-        im = Image.open(io.BytesIO(blob)); im.load()
+        im = Image.open(io.BytesIO(blob))
+        if im.format == "JPEG": im.draft("RGB", (MAX_SIDE, MAX_SIDE))        # JPEG 는 처음부터 줄여서 풀어 메모리를 아낀다 (큰 사진을 통째로 풀지 않음)
+        im.load()
         if max(im.size) > MAX_SIDE:
             im.thumbnail((MAX_SIDE, MAX_SIDE))
         if im.mode not in ("RGB", "L"):
@@ -44,6 +61,10 @@ def prepare(blob):
         return mime, data
     except Exception:
         return None
+    finally:
+        try:
+            if im is not None: im.close()
+        except Exception: pass
 
 
 def shrink(att, side=900, keep=4):

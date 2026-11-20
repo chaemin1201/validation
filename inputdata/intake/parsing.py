@@ -171,7 +171,8 @@ _PII_LABEL_TAIL = re.compile(r"학[ \t]*번[ \t]*[:：][^\n]*")                 
 _PII_LABEL_LINE = re.compile(r"(?m)^[ \t]*[-•*·]?[ \t]*(?:성[ \t]*명|학[ \t]*과|소[ \t]*속|제[ \t]*출[ \t]*자|작[ \t]*성[ \t]*자)[ \t]*[:：][^\n]*\n?")
 _PII_TOKENS = (re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+"),                                                        # 이메일
                re.compile(r"(?<!\d)01[016-9][-\s]?\d{3,4}[-\s]?\d{4}(?!\d)"),                                          # 휴대전화
-               re.compile(r"(?<!\d)\d{6}-[1-4]\d{6}(?!\d)"))                                                       # 주민등록번호
+               re.compile(r"(?<!\d)\d{6}-[1-4]\d{6}(?!\d)"),                                                       # 주민등록번호
+               re.compile(r"[가-힣A-Za-z]{2,12}(?:학부|학과|전공)[_\s-]*\d{7,10}[_\s-]*[가-힣]{2,4}"))                  # '소프트웨어학부_20255255_홍길동' 같은 머리글(학과_학번_이름)
 
 
 def redact_text(text, labels=True):
@@ -211,6 +212,225 @@ def build_records(table_path=None, original_paths=(), pattern=None, labels=None,
         return kind, redact_records(recs)
     finally:
         for d in tmp: shutil.rmtree(d, ignore_errors=True)
+
+
+_NO_PROBLEM = "문서에서 문제를 찾지 못했습니다"
+
+
+_IMPERATIVE = re.compile(r"(?:하시오|하세요|하십시오|하라|쓰시오|쓰세요|구하시오|구하세요|답하시오|고르시오|고르세요|써라|[을를]\s*작성)")
+_IO_SIGNS = re.compile(r"입력\s*예|출력\s*예|입출력\s*예|실행\s*결과|예상\s*출력|정답\s*코드")
+_PROBLEM_HEAD = re.compile(r"(?m)^[ \t|]*[\[(<]?\s*(?:문제|실습|과제|연습|Problem|Q)\s*\d")
+
+
+_QUIZ_HEAD = re.compile(r"(?im)^[ \t\f]*[■▶●◆□▪\[(<]*[ \t]*(?:확인[ \t]*학습|확인[ \t]*문제|연습[ \t]*문제|복습[ \t]*문제|학습[ \t]*확인|퀴즈|Check[ \t]*Point|Exercises?|Review[ \t]*Questions?|Q[ \t]*&[ \t]*A)[ \t]*[\])>]?[ \t:：]*[^\n]{0,15}$")
+
+
+def split_quiz(txt):
+    """(강의 내용, 끝의 확인 학습 구역). 확인 학습 제목이 없으면 (전체, '')."""
+    m = _QUIZ_HEAD.search(txt or "")
+    return ((txt[:m.start()], txt[m.start():]) if m else (txt or "", ""))
+
+
+def _quiz_signals(txt):
+    """글 속 '~하시오/하세요' 같은 명령형과 물음표의 개수 (학생이 풀어야 할 문항이 섞여 있다는 신호)."""
+    return len(_IMPERATIVE.findall(txt)) + txt.count("?")
+
+
+def _lecture_like_text(txt):
+    """강의자료로 볼 만한 글인가: 문제 제목·입출력 예 같은 확실한 문제 구조가 없고, 문제 신호('~하시오'·물음표)가 강의 길이에 비해 많지 않을 때 True.
+    강의 끝이나 중간에 확인 학습 문항이 몇 개 섞여 있는 것은 강의자료다(그 문항은 문제로 함께 옮긴다). 애매하면 False(문제 파일로 처리)."""
+    body = split_quiz(txt)[0]
+    if len(re.sub(r"\s+", "", body)) < 200: return False
+    if _PROBLEM_HEAD.search(txt) or _IO_SIGNS.search(txt): return False
+    return _quiz_signals(body) <= max(8, len(body) // 500)
+
+
+_PROBLEM_CUE = re.compile(r"입력\s*받|프로그램을?\s*(?:작성|만들)|작성해|구하(?:시|세|라|여)|계산하(?:시|세|라)|쓰시오|설명하시오")           # 강의 설명에도 흔한 '출력한다' 는 문제 신호로 세지 않는다
+
+
+def _cue_count(t):
+    """글 속 문제 신호의 개수: 명령형('~하시오')·물음표·'입력받아 출력' 같은 말·입출력 예."""
+    return _quiz_signals(t) + len(_PROBLEM_CUE.findall(t)) + len(_IO_SIGNS.findall(t))
+
+
+def lecture_with_problems(path, recs):
+    """문제로 찾아낸 것(recs)이 사실 강의자료 속 소제목이거나 강의 끝의 확인 학습인가. (판정, 확인 학습이 들어 있는가)
+    ① 찾은 '문제' 대부분에 문제 신호가 전혀 없고 글 전체가 강의 같으면: 번호 붙은 강의 소제목을 문제로 잘못 찾은 것.
+    ② 찾은 문제가 문서 글의 작은 부분(40% 미만)이고 그 앞에 긴 강의 글이 있으면: 앞은 강의, 찾은 것은 확인 학습.
+    문제 신호가 있는 문제가 많으면(문제지) 둘 다 아니다. 애매하면 문제 파일로 둔다."""
+    if not recs: return False, False
+    bodies = [str(r.get("원본조각") or "") + " " + str(r.get("정답자료") or "") for r in recs]
+    whole = chr(10).join(bodies)
+    if _IO_SIGNS.search(whole): return False, False
+    with_cue = sum(1 for b in bodies if _cue_count(split_quiz(b)[0]) > 0)         # 확인 학습 구역은 빼고 강의 부분의 문제 신호만 센다
+    if with_cue <= 0.34 * len(recs) and _lecture_like_text(whole): return True, bool(split_quiz(whole)[1].strip()) or _quiz_signals(whole) >= 3
+    try:
+        txt = pdf_intake.read_text(path) or ""
+    except (SystemExit, Exception):
+        return False, False
+    total, covered = len(re.sub(r"\s+", "", txt)), len(re.sub(r"\s+", "", whole))
+    if total < 500 or covered > 0.4 * total: return False, False
+    first = next((b.strip()[:20] for b in bodies if len(b.strip()) >= 8), "")
+    i = txt.find(first) if first else -1
+    head = txt[:i] if i > 0 else ""
+    if len(re.sub(r"\s+", "", head)) >= 300 and _lecture_like_text(head): return True, True
+    return False, False
+
+
+def _lecture_unit(path, label, idx, count=None, strict=False, quiz=False):
+    """문제가 아니라 강의자료인 파일: 글 전체를 읽어 레코드 하나(rec["강의자료"]=True)로 만든다. AI 는 이 내용에서 비슷한 새 문제 count 개를 만든다."""
+    try:
+        txt = pdf_intake.read_text(path)
+    except (SystemExit, Exception):
+        raise IntakeInputError("파일을 읽을 수 없습니다.")
+    txt = (txt or "").strip()
+    if len(re.sub(r"\s+", "", txt)) < 200:
+        raise IntakeInputError("읽을 수 있는 글이 너무 적어 강의자료로 처리할 수 없습니다(스캔·그림 문서일 수 있습니다).")
+    if strict and not _lecture_like_text(txt):                    # 자동 판별: 문제 신호(입출력 예·'~하시오'·물음표 등)가 있으면 문제지이므로 강의자료로 보지 않는다
+        raise IntakeInputError("문제 신호가 있어 강의자료로 보지 않습니다.")
+    n = max(1, min(10, int(count))) if count else config.lecture_problems()
+    cap = config.whole_doc_chars()
+    memo = [f"문제가 아니라 강의자료로 보고 이 내용에서 비슷한 문제 {n}개를 AI 가 만듦 → 만들어진 문제는 모두 사람이 확인하고 승인해야 함"]
+    if len(txt) > cap:
+        memo.append(f"강의자료가 길어 앞 {cap}자만 사용함")
+        txt = txt[:cap]
+    stem = pdf_intake.file_stem(label or path) or "강의자료"
+    key = f"{stem}_강의"
+    intake = {"이미지의심": False, "방식표기": [], "입출력예수": 0, "빈칸표기": False, "링크": False, "유형힌트": "", "메모": memo}
+    lang = pdf_intake.language_hint(txt)
+    if lang: intake["언어힌트"] = lang
+    rec = {"입력종류": "원본", "원본형식": pdf_intake.format_of(path), "key": key, "id": key, "page": 1, "원본조각": txt, "문서전체": True, "강의자료": True, "생성수": n,
+           "intake": intake, "파일": label}
+    if quiz or split_quiz(txt)[1].strip() or _quiz_signals(txt) >= 3:
+        rec["확인학습"] = True                                       # 강의에 들어 있는 확인 학습(연습 문제·질문)도 문제로 함께 옮긴다
+        memo.append("강의에 확인 학습(연습 문제·질문)이 있어 그 문제도 함께 옮김")
+    rec = redact_records([rec])[0]                                # 학번·이름 칸, 전화번호 등 개인정보를 AI 에 보내기 전에 지운다 (문제 파일과 같은 규칙)
+    return {"kind": "원본", "records": [rec], "files": [label], "original_idx": [idx]}
+
+
+_SOL_TOKENS = re.compile(r"풀이|정답|해설|답안|solutions?|answers?|\bsol\b", re.I)
+_PROB_TOKENS = re.compile(r"과제|문제지|문제|problems?|assignments?|worksheets?", re.I)
+
+
+def _pair_key(label):
+    """문제 파일과 풀이 파일이 같은 짝인지 비교할 이름: 확장자·'풀이/정답/과제/문제' 같은 말·구분 기호를 지운 것. 'cpp_week07_과제.docx' 와 'cpp_week07_과제_풀이.docx' 는 같은 키."""
+    stem = os.path.splitext(os.path.basename(str(label or "")))[0]
+    stem = _SOL_TOKENS.sub("", stem)
+    stem = _PROB_TOKENS.sub("", stem)
+    return re.sub(r"[\s_\-().\[\]]+", "", stem).lower()
+
+
+def _group_originals(labels, idx):
+    """원본 파일 번호 목록 idx 를 '함께 처리해야 하는 묶음'으로 나눈다: 풀이(정답) 파일은 이름이 같은 문제 파일과 한 묶음, 나머지 파일은 파일마다 한 묶음.
+    짝을 이름으로 찾을 수 없는 풀이 파일이 있으면 옛 방식(풀이 자료를 문제 파일 전체와 공유)대로 전부 한 묶음으로 둔다."""
+    prob = [i for i in idx if not is_solution(labels[i])]
+    sol = [i for i in idx if is_solution(labels[i])]
+    if not prob: return [list(idx)] if idx else []
+    groups = {}
+    for i in prob: groups.setdefault(_pair_key(labels[i]), []).append(i)
+    left = []
+    for i in sol:
+        k = _pair_key(labels[i])
+        if k in groups: groups[k].append(i)
+        else: left.append(i)
+    if left: return [list(idx)]
+    return sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
+
+
+def _table_ids(tables):
+    """표(엑셀·CSV·DB)에 적힌 문제 이름에서 뽑은 문제 ID 집합 (짝이 되는 원본 문서를 찾는 데 쓴다)."""
+    ids = set()
+    for tp in tables:
+        try:
+            for r in xlsx_intake.read(tp):
+                n = name_id(r["fields"].get("이름", ""))
+                if n: ids.add(n)
+        except BaseException:
+            continue
+    return ids
+
+
+def iter_units(table_path=None, original_paths=(), pattern=None, labels=None, table_labels=None, material="auto", count=None, errors=None):
+    """묶음(작업 하나)을 하나씩 만들어 내주는 generator. 한 묶음을 내주면 호출한 쪽이 저장하고 버린 뒤 다음 묶음을 읽는다(파일을 한꺼번에 읽어 메모리에 쌓아 두지 않는다).
+    각 묶음: {"kind", "records", "files", "original_idx"}. 레코드마다 rec["파일"] 에 파일 이름을 적는다. errors 목록에 읽지 못한 파일 안내를 더한다.
+    묶음: ① 표(엑셀·CSV·DB)와 그 표의 문제 ID 가 들어 있는 원본 문서(짝) ② 풀이(정답) 파일과 이름이 같은 문제 파일 ③ 그 밖의 원본은 파일마다 하나.
+    ③ 중 문제를 하나도 못 찾는 파일(문제 신호도 없음)은 강의자료로 보고, 번호 붙은 소제목을 문제로 잘못 찾은 강의자료나 확인 학습만 문제로 찾은 경우도 가려낸다(material=auto).
+    한 파일이 읽히지 않아도 다른 묶음은 계속하고 안내만 남긴다(하나도 못 만들면 마지막에 오류)."""
+    originals = list(original_paths)
+    labels = list(labels) if labels else [os.path.basename(str(p)) for p in originals]
+    tables = [table_path] if isinstance(table_path, (str, os.PathLike)) else [p for p in (table_path or []) if p]
+    tlabels = list(table_labels) if table_labels else [os.path.basename(str(p)) for p in tables]
+    mat = str(material or "auto").lower()
+    errors = errors if errors is not None else []
+    excs, made = [], 0
+    rest = list(range(len(originals)))
+    if tables:                                                    # 표와 짝이 되는 원본만 표와 함께, 나머지는 아래에서 파일마다
+        ids = _table_ids(tables)
+        paired = [i for i in rest if ids and _pairs_with_table(originals[i], ids)]
+        rest = [i for i in rest if i not in paired]
+        unit = None
+        try:
+            kind, recs = build_records(tables, [originals[i] for i in paired], pattern, [labels[i] for i in paired], tlabels)
+            names = [n for n in tlabels + [labels[i] for i in paired] if n]
+            tag = names[0] if len(names) == 1 else ", ".join(names)
+            for r in recs: r["파일"] = tag
+            unit = {"kind": kind, "records": recs, "files": names, "original_idx": paired}
+        except IntakeInputError as e:
+            errors.append(f"{', '.join(tlabels)}: {e}"); excs.append(e)
+        if unit is not None:
+            made += 1; yield unit; unit = None
+    for g in _group_originals(labels, rest):
+        names = [labels[i] for i in g]
+        unit = None
+        try:
+            if mat == "lecture" and len(g) == 1:
+                unit = _lecture_unit(originals[g[0]], names[0], g[0], count)
+            else:
+                kind, recs = build_records([], [originals[i] for i in g], pattern, names, None)
+                if mat == "auto" and len(g) == 1:                                       # 강의 소제목을 문제로 잘못 찾았거나, 강의 끝의 확인 학습만 문제로 찾은 경우
+                    is_lec, has_quiz = lecture_with_problems(originals[g[0]], recs)
+                    if is_lec:
+                        try: unit = _lecture_unit(originals[g[0]], names[0], g[0], count, strict=False, quiz=has_quiz)
+                        except IntakeInputError: unit = None
+                if unit is None:
+                    tag = names[0] if len(names) == 1 else ", ".join(names)
+                    for r in recs: r["파일"] = tag
+                    unit = {"kind": kind, "records": recs, "files": names, "original_idx": list(g)}
+        except IntakeInputError as e:
+            if mat == "auto" and len(g) == 1 and _NO_PROBLEM in str(e):                # 문제를 못 찾은 파일: 문제 신호가 없으면 강의자료
+                try: unit = _lecture_unit(originals[g[0]], names[0], g[0], count, strict=True)
+                except IntakeInputError: unit = None
+            if unit is None:
+                errors.append(f"{', '.join(names)}: {e}"); excs.append(e)
+        if unit is not None:
+            made += 1; yield unit; unit = None
+    if not made:
+        if len(excs) == 1: raise excs[0]                          # 묶음이 하나뿐이면 원래 안내를 그대로
+        raise IntakeInputError("; ".join(errors) or "처리할 문제를 찾지 못했습니다.")
+
+
+def build_units(table_path=None, original_paths=(), pattern=None, labels=None, table_labels=None, material="auto", count=None):
+    """([묶음 목록], 읽지 못한 파일 안내 목록): iter_units 를 한꺼번에 모은 것 (시험·미리보기용)."""
+    errors = []
+    return list(iter_units(table_path, original_paths, pattern, labels, table_labels, material, count, errors)), errors
+
+
+def unit_hash(unit):
+    """한 묶음(작업 하나)의 내용 해시: 레코드의 원문(원본조각·정답자료·엑셀 값)을 공백 없이 이어 sha256. 같은 내용의 파일은 파일 이름·올린 시각이 달라도 같은 값이다."""
+    import hashlib, json as _json
+    parts = []
+    for r in unit["records"]:
+        parts.append(re.sub(r"\s+", "", str(r.get("원본조각") or "") + str(r.get("정답자료") or "")))
+        if isinstance(r.get("fields"), dict): parts.append(re.sub(r"\s+", "", _json.dumps(r["fields"], ensure_ascii=False, sort_keys=True)))
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def build_records_per_file(table_path=None, original_paths=(), pattern=None, labels=None, table_labels=None, material="auto", count=None):
+    """(입력종류, 레코드 목록, 읽지 못한 파일 안내 목록): build_units 를 한 목록으로 합친 것 (미리보기용)."""
+    units, errors = build_units(table_path, original_paths, pattern, labels, table_labels, material, count)
+    recs = [r for u in units for r in u["records"]]
+    kinds = {u["kind"] for u in units}
+    return (units[0]["kind"] if len(kinds) == 1 else "혼합"), recs, errors
 
 
 def _build_records(table_path, original_paths, pattern, labels, table_labels, tmp):
@@ -354,7 +574,7 @@ def _whole_doc_records(paths, labels, names, only=None):
 
 
 def prompt_input(rec):
-    return {k: v for k, v in rec.items() if k not in ("key", "이미지")}          # 그림 자체는 글에 넣지 않고 따로 붙인다
+    return {k: v for k, v in rec.items() if k not in ("key", "이미지", "파일")}          # 그림 자체는 글에 넣지 않고 따로 붙인다
 
 
 def attached_images(rec):
@@ -382,6 +602,14 @@ def user_text(rec, mode="none"):
         whole = ("[스캔 문서] 이 입력은 글 층이 없는 스캔 문서의 쪽 그림입니다(원본조각이 비어 있음). 그림을 보고 문제를 찾아 문제 단위로 나누고 문제마다 JSON 한 줄씩 출력하세요. "
                  f"id 와 title 은 {rec.get('key')}_01, {rec.get('key')}_02 … 순서로 쓰고, 문제가 아닌 부분(표지·목차·설명)은 건너뛰세요. 그림에서 읽은 코드·숫자는 확인필요에 읽기 불확실성을 적고, 읽을 수 없는 부분은 지어내지 마세요.\n")
         return f"채점 모드: {mode}\n{_GUARD}\n{_NUDGE}\n{whole}입력: " + json.dumps(prompt_input(rec), ensure_ascii=False)
+    if rec.get("강의자료"):
+        n, key = rec.get("생성수") or 5, rec.get("key")
+        lec = (f"[강의자료] 이 입력은 문제가 아니라 강의자료입니다(원본조각이 강의 내용). 강의 내용을 읽고 이 강의의 핵심 개념을 확인하는 새 문제 {n}개를 만드세요. "
+               "강의의 예제·개념과 비슷하지만 같지는 않게 만들고(예제를 그대로 베끼지 않음), 코딩·디버깅·단답형·객관식을 강의 내용에 맞게 섞습니다(코딩은 입력을 받는 문제도 포함). 강의에 나오지 않은 내용은 묻지 마세요. "
+               + ("이 강의자료에는 확인 학습(연습 문제·질문처럼 학생이 풀어야 할 문항)이 들어 있습니다. 그 문항은 모두 원문 그대로 문제로 옮기고(문서의 순서대로, 문서에 정답이 있으면 정답도 옮김) 먼저 출력한 뒤, 이어서 강의 내용으로 새로 만든 문제를 출력하세요(새 문제 수는 위의 개수). " if rec.get("확인학습") else "")
+               + f"문제마다 JSON 한 줄씩 출력하고 id 와 title 은 {key}_01, {key}_02 … 순서로 쓰세요. 이 입력에는 원문 보존 원칙을 적용하지 않습니다(옮기는 확인 학습 문제는 원문 그대로): description 은 문제로 새로 쓰되 정답·풀이는 설명에 넣지 않습니다. "
+               "코딩·디버깅은 정답 코드(reference_codes)를 실행 가능하게 완성해 쓰고, 입력을 받는 문제는 서로 다른 입력의 테스트 케이스를 만들어 출력은 정답 코드를 따라가 확정합니다. 단답형·객관식은 정답을 채웁니다.\n")
+        return f"채점 모드: {mode}\n{_GUARD}\n{lec}입력: " + json.dumps(prompt_input(rec), ensure_ascii=False)
     whole = ("[문서 전체] 이 입력은 문제 번호를 찾지 못해 문서 전체를 보낸 것입니다. 문서에서 문제를 찾아 문제 단위로 나누고 문제마다 JSON 한 줄씩 출력하세요. "
              f"id 와 title 은 {rec.get('key')}_01, {rec.get('key')}_02 … 순서로 쓰고, 문제가 아닌 부분(표지·목차·설명)은 건너뛰세요.\n") if rec.get("문서전체") else ""
     return f"채점 모드: {mode}\n{_GUARD}\n{_NUDGE}\n{whole}입력: " + json.dumps(prompt_input(rec), ensure_ascii=False)

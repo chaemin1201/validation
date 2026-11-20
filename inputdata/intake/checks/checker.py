@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from app.inputdata.schemas import problem_adapter, format_validation_errors     # 프로젝트의 실제 스키마로 검사한다
 from app.inputdata.dedupe import compute_content_hash                            # 서버 중복 방지와 같은 규칙
 from . import fix
-from .fix import echo_warnings, has_markdown_bold
+from .fix import echo_warnings, has_markdown_bold, _same_ignoring_echo
 
 logger = logging.getLogger(__name__)
 
@@ -300,7 +300,7 @@ def check_case(case, seen_hashes, skip_exec):
                     if warn and f"exec: {warn}" not in warns: warns.append(f"exec: {warn}")
                     if status == "skip": warns.append(f"exec: {out}"); break
                     if status == "error": fails.append(f"exec: 케이스 {i} {out}"); continue
-                    if norm_out(out) != norm_out(tc.expected_output):
+                    if norm_out(out) != norm_out(tc.expected_output) and not _same_ignoring_echo(tc.expected_output, out, tc.input, ref.code, ref.language):      # 입력값을 안내 문구 뒤에 보인 기대 출력은 표준출력과 입력값 표시만 다르면 일치
                         ws = " (공백·줄바꿈만 다름: 엑셀/원본 옮기기 중 줄바꿈이 바뀌었을 수 있음)" if _nz(out) == _nz(tc.expected_output) else ""
                         fails.append(f"exec: 케이스 {i} 출력 불일치{ws} → 기대 {tc.expected_output!r} / 실제 {norm_out(out)!r}")
     if ptype == "단답형" and isinstance(payload.get("answer_text"), dict):

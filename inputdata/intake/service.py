@@ -2,6 +2,7 @@
 """작업 생성 · AI 처리 · 검사 · 등록 · 승인 로직."""
 import asyncio
 import base64
+import copy
 import inspect
 import json
 import logging
@@ -15,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException
 from pydantic import ValidationError
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from app.problem.models.problem import Problem
@@ -25,7 +26,7 @@ from app.inputdata.dedupe import DuplicateProblemError, TitleTakenError, compute
 from app.inputdata.schemas import format_validation_errors, problem_adapter
 from ..crud.inputdata import create_problem
 from . import config, llm
-from .checks import checker
+from .checks import checker, pipeline
 from .readers import images as images_mod, capture as capture_mod
 from .models import (EDITABLE, IntakeCapture, ProblemTitleSeq, extras, unwrap as unwrap_description, wrap as wrap_description, AI_FAILED, APPROVABLE, BLOCKED, DUPLICATE, HELD, NEEDS_INPUT, NEEDS_REVIEW, PENDING, PROCESSING,
                      READY, REGISTER_FAILED, REGISTERED, IntakeItem, IntakeJob)
@@ -107,37 +108,100 @@ async def purge_old_jobs(db):
     """보관 기간(INTAKE_JOB_DAYS)이 지난, 처리가 끝난 작업을 지운다. 새 작업을 올릴 때 함께 한다."""
     if not config.job_days(): return 0
     cutoff = _now() - timedelta(days=config.job_days())
-    old = (await db.execute(select(IntakeJob.job_id).where(IntakeJob.created_at < cutoff, IntakeJob.status != "processing"))).scalars().all()
+    old = (await db.execute(select(IntakeJob.job_id).where(IntakeJob.created_at < cutoff, IntakeJob.status.not_in(["processing", "queued"])))).scalars().all()
     return await delete_jobs(db, old)
 
 
-async def create_job(db, maker_id, kind, file_names, records, mode, auto_register):
+async def create_job(db, maker_id, kind, file_names, records, mode, auto_register, status="processing", content_hash=None, problems=None):
     await purge_old_jobs(db)
     job_id = str(uuid.uuid4())
-    db.add(IntakeJob(job_id=job_id, maker_id=maker_id, status="processing", input_kind=kind, file_names=list(file_names),
-                     options={"mode": mode, "auto_register": bool(auto_register)}, records_total=len(records), heartbeat_at=_now()))
+    plan = []                                                    # 파일별 문제 번호 범위 (처리를 파일 하나씩 하고 결과도 파일마다 돌려주기 위해)
+    for i, rec in enumerate(records, 1):
+        f = rec.get("파일")
+        if plan and plan[-1]["name"] == f: plan[-1]["to"] = i
+        else: plan.append({"name": f, "from": i, "to": i})
+    if not any(x["name"] for x in plan): plan = []
+    db.add(IntakeJob(job_id=job_id, maker_id=maker_id, status=status, input_kind=kind, file_names=list(file_names),
+                     options={"mode": mode, "auto_register": bool(auto_register), "files": plan, "content_hash": content_hash, "problems": problems, "queue_no": time.time_ns()}, records_total=len(records), heartbeat_at=_now()))
     await db.flush()
     for i, rec in enumerate(records, 1):
         db.add(IntakeItem(job_id=job_id, seq=i, out_index=0, source_key=str(rec["key"]), record=rec, status=PENDING))
     await db.commit()
     return job_id
 
+async def find_same_content(db, maker_id, content_hash):
+    """이 사용자가 이미 올려 처리했거나 처리 중인 작업 중 내용이 같은 것(parsing.unit_hash). 실패·중단한 작업은 다시 올릴 수 있으므로 제외한다. 없으면 None."""
+    if not content_hash: return None
+    rows = (await db.execute(select(IntakeJob).where(IntakeJob.maker_id == maker_id, IntakeJob.status.in_(["done", "processing", "queued"])).order_by(IntakeJob.created_at.desc()))).scalars().all()
+    for j in rows:
+        if (j.options or {}).get("content_hash") == content_hash:
+            return {"job_id": j.job_id, "status": j.status, "files": list(j.file_names or []), "created_at": j.created_at.isoformat() if j.created_at else None}
+    return None
+
 async def daily_usage(db, maker_id):
-    """오늘(서버 시간 0시부터) 이 사용자가 만든 작업 수와 문제 수. 일일 한도 확인용."""
+    """오늘(서버 시간 0시부터) 이 사용자가 만든 작업 수와 문제 수. 일일 한도 확인용. 강의자료는 만들어질 문제 수(생성수)로 센다."""
     start = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-    row = (await db.execute(select(func.count(), func.coalesce(func.sum(IntakeJob.records_total), 0)).where(IntakeJob.maker_id == maker_id, IntakeJob.created_at >= start))).one()
-    return int(row[0] or 0), int(row[1] or 0)
+    rows = (await db.execute(select(IntakeJob.options, IntakeJob.records_total).where(IntakeJob.maker_id == maker_id, IntakeJob.created_at >= start))).all()
+    return len(rows), sum(int((o or {}).get("problems") or n or 0) for o, n in rows)
+
+_RECOVER_LOCK = asyncio.Lock()
+RESTART_MSG = "서버가 다시 시작되어 중단되었습니다. 이어서 처리하려면 resume 을 호출하세요."
+
+async def recover_stalled(db, maker_id):
+    """서버가 재시작되어 일하는 곳이 없어진 작업(처리 중·대기 중이었던 것, 또는 재시작 때문에 중단 표시가 된 것)을 찾아 남은 문제를 되살리고 만든 순서대로 job_id 목록을 돌려준다.
+    호출한 쪽이 이 목록을 process_queue 로 다시 시작한다. 이미 살아 있는 작업이 하나라도 있으면(지금 처리 중인 것이 있음) 아무것도 하지 않는다 — 한 사용자의 작업은 한 번에 하나씩이다.
+    AI 오류로 사람이 resume 해야 하는 작업(paused)은 건드리지 않는다. 메모리에 새로 올리는 것은 없고 DB 의 작업 상태만 본다."""
+    async with _RECOVER_LOCK:                                                # 이 프로세스 안에서 조회가 겹쳐도 한 번에 하나만 복구한다
+        rows = (await db.execute(select(IntakeJob).where(IntakeJob.maker_id == maker_id, IntakeJob.status.in_(["processing", "queued", "paused"])).order_by(IntakeJob.created_at, IntakeJob.job_id))).scalars().all()
+        rows.sort(key=lambda j: ((j.options or {}).get("queue_no") or 0, str(j.created_at), j.job_id))      # 만든 순서 (같은 초에 만든 작업도 순서를 지킨다)
+        if any(j.status in ("processing", "queued") and _alive(j) for j in rows): return []
+        dead = [j for j in rows if j.status in ("processing", "queued") or (j.status == "paused" and j.message == RESTART_MSG)]
+        claimed = []
+        for j in dead:                                                       # 읽은 값이 그대로일 때만 가져온다(다른 서버 프로세스가 먼저 가져갔으면 0줄이 바뀌어 건너뜀)
+            hb = IntakeJob.heartbeat_at.is_(None) if j.heartbeat_at is None else IntakeJob.heartbeat_at == j.heartbeat_at
+            res = await db.execute(update(IntakeJob).where(IntakeJob.job_id == j.job_id, IntakeJob.status == j.status, hb).values(status="queued", message=None, heartbeat_at=_now()))
+            if res.rowcount: claimed.append(j.job_id)
+        for jid in claimed: await reset_failed(db, jid, retry_ai_failed=False)  # 호출 도중 끊겨 processing 으로 남은 문제를 다시 대기로
+        await db.commit()
+        return claimed
 
 async def active_job(db, maker_id):
     """처리 중인 작업이 있으면 돌려준다. 서버 재시작 등으로 멈춘 작업은 'paused' 로 바꾼다."""
-    rows = (await db.execute(select(IntakeJob).where(IntakeJob.maker_id == maker_id, IntakeJob.status == "processing"))).scalars().all()
+    rows = (await db.execute(select(IntakeJob).where(IntakeJob.maker_id == maker_id, IntakeJob.status.in_(["processing", "queued"])))).scalars().all()
     live = None
     for j in rows:
         if _alive(j): live = j
         else:
-            j.status, j.message = "paused", "서버가 다시 시작되어 중단되었습니다. 이어서 처리하려면 resume 을 호출하세요."
+            j.status, j.message = "paused", RESTART_MSG
     await db.commit()
     return live
+
+def file_of(plan, seq):
+    """파일별 범위 계획(plan)에서 문제 번호(seq)가 속한 파일 이름. 계획이 없으면 None."""
+    for f in plan or []:
+        if f["from"] <= seq <= f["to"]: return f["name"]
+    return None
+
+async def file_progress(db, job):
+    """파일마다 상태·진행: waiting(차례 기다림) | processing(지금 처리 중) | done(처리 끝) | paused(실패가 있어 멈춤)."""
+    plan = (job.options or {}).get("files") or []
+    if not plan: return []
+    rows = (await db.execute(select(IntakeItem.seq, IntakeItem.status).where(IntakeItem.job_id == job.job_id))).all()
+    cur = (job.options or {}).get("current_file")
+    out = []
+    for f in plan:
+        mine = [st for seq, st in rows if f["from"] <= seq <= f["to"]]
+        counts = {}
+        for st in mine: counts[st] = counts.get(st, 0) + 1
+        waiting = sum(counts.get(x, 0) for x in (PENDING, PROCESSING))
+        failed = counts.get(AI_FAILED, 0)
+        if waiting == 0 and failed == 0: st = "done"
+        elif job.status == "processing": st = "processing" if f["name"] == cur else "waiting"
+        elif failed: st = "paused"
+        else: st = "waiting"
+        out.append({"name": f["name"], "records_total": len(set(seq for seq, _ in rows if f["from"] <= seq <= f["to"])), "records_done": len(set(seq for seq, s_ in rows if f["from"] <= seq <= f["to"] and s_ not in (PENDING, PROCESSING, AI_FAILED))),
+                    "status": st, "counts": counts})
+    return out
 
 async def job_summary(db, job):
     counts = dict((await db.execute(select(IntakeItem.status, func.count()).where(IntakeItem.job_id == job.job_id).group_by(IntakeItem.status))).all())
@@ -148,12 +212,13 @@ async def job_summary(db, job):
     return {"job_id": job.job_id, "status": job.status, "message": job.message, "input_kind": job.input_kind, "files": job.file_names,
             "ai_filled": len(filled), "ai_filled_registered": sum(1 for st in filled if st == REGISTERED),     # 사후 점검 대상 수
             "auto_register": (job.options or {}).get("auto_register", True), "records_total": job.records_total,
-            "records_done": job.records_total - waiting, "counts": counts,
+            "records_done": job.records_total - waiting, "counts": counts, "file_progress": await file_progress(db, job),
             "needs_action": counts.get(NEEDS_REVIEW, 0) + counts.get(NEEDS_INPUT, 0) + counts.get(READY, 0) + counts.get(BLOCKED, 0) + counts.get(HELD, 0) + counts.get(REGISTER_FAILED, 0) + counts.get(AI_FAILED, 0),
             "created_at": job.created_at.isoformat() if job.created_at else None}
 
-async def reset_failed(db, job_id):
-    rows = (await db.execute(select(IntakeItem).where(IntakeItem.job_id == job_id, IntakeItem.status == AI_FAILED))).scalars().all()
+async def reset_failed(db, job_id, retry_ai_failed=True):
+    """AI 호출이 실패했거나(retry_ai_failed) 호출 도중 서버가 멈춰 processing 으로 남은 문제를 다시 처리 대기(pending)로 돌린다. 일하는 곳이 없는 작업에만 쓴다."""
+    rows = (await db.execute(select(IntakeItem).where(IntakeItem.job_id == job_id, IntakeItem.status.in_([AI_FAILED, PROCESSING] if retry_ai_failed else [PROCESSING])))).scalars().all()
     n = len(rows)
     for it in rows: it.status, it.error = PENDING, None
     await db.commit()
@@ -183,6 +248,15 @@ class SlowCall(Exception):
     """AI 응답이 기한 안에 오지 않아 그 문제를 보류로 돌리는 경우."""
 
 async def _timed(fn, *args):
+    """AI 호출 하나를 pipeline.AI_GATE 의 차례를 기다린 뒤 보낸다 (서버 전체 동시 호출 수·시작 간격 제한, 혼잡하면 속도를 낮춤). 기다리는 시간은 응답 기한에 넣지 않는다."""
+    await pipeline.AI_GATE.enter()
+    try:
+        r = await _timed_raw(fn, *args)
+    except BaseException as e:
+        pipeline.AI_GATE.leave(pipeline.AI_GATE.is_overload(e)); raise
+    pipeline.AI_GATE.leave(); return r
+
+async def _timed_raw(fn, *args):
     """AI 호출 하나를 별도 스레드에서 실행하고 기다린다. config.call_deadline() 초를 넘기면 그 요청을 버리고 같은 요청을 한 번 더 보낸다(멈춘 호출 하나가 작업 전체를 붙잡지 않게)."""
     dl = config.call_deadline()
     if not dl:
@@ -263,6 +337,18 @@ async def process_job(job_id, ai_fn=None):
     finally:
         _RUNNING.discard(job_id)
 
+async def process_queue(job_ids, ai_fn=None):
+    """작업 여럿(파일마다 작업 하나)을 차례로 처리한다. 앞 작업이 끝나야 다음 작업이 시작되고(그동안 queued), 한 작업이 멈춰도 다음 작업은 계속한다.
+    기다리는 작업도 heartbeat 를 계속 남겨 서버가 살아 있는 동안 '멈춘 작업'으로 오인되지 않게 한다."""
+    keeps = {jid: asyncio.create_task(_keepalive(jid)) for jid in job_ids[1:]}
+    try:
+        for jid in job_ids:
+            t = keeps.pop(jid, None)
+            if t: t.cancel()
+            await process_job(jid, ai_fn)
+    finally:
+        for t in keeps.values(): t.cancel()
+
 def _forced_hold(rec):
     """엑셀(또는 둘 다) 입력에서 이름이 없거나 같은 이름이 여러 번 나오면 AI 를 부르지 않고 바로 보류한다 (제목을 임의로 바꿔 등록하지 않기 위해)."""
     why = fix.unsolvable_reference(rec)
@@ -298,20 +384,19 @@ def _batch_key(rec):
     return (rec.get("입력종류"), rec.get("원본형식") or rec.get("표형식") or "")
 
 async def _precheck(row, rec, exec_on):
-    """AI 가 낸 결과 한 줄을 저장 전에 서버 검사로 미리 돌려 보고, 막힐 이유(중복 제외)를 돌려준다. (원본 row 는 바꾸지 않는다)"""
+    """AI 가 낸 결과 한 줄을 저장 전에 서버 검사로 미리 돌려 보고, 막힐 이유(중복 제외)를 돌려준다. 저장할 때와 같은 pipeline 단계를 거치므로 서버가 스스로 고치는 것(설명 정리 등)은 다시 쓰게 하지 않는다. (원본 row 는 바꾸지 않는다)"""
     import copy
-    p = copy.deepcopy(row.get("payload")); rv = copy.deepcopy(row.get("review") or {})
+    if row.get("payload") is None: return []                   # 보류 결과(payload 없음)는 검사할 것이 없다
+    ctx = pipeline.Ctx(rec=rec, row=copy.deepcopy(row), exec_on=exec_on)
+    await asyncio.to_thread(pipeline.run, ctx)
+    p = ctx.payload
     if p is None: return []
-    if exec_on: await asyncio.to_thread(fix.fill, p, rv, checker.run_code, checker.norm_out)
-    p, _ = fix.normalize(p, rv)
-    if p is None: return []                                    # 보류 결과(payload 없음)는 검사할 것이 없다
-    fix.drop_false_injection(rec, rv)
-    fix_title(rec, p)
-    case = {"id": row.get("id"), "payload": p, "review": rv}
-    if rec.get("원본조각"): case["원본조각"] = rec["원본조각"]
-    if rec.get("이미지"): case["그림있음"] = True
-    fails, _w = await asyncio.to_thread(checker.check_case, case, {}, not exec_on)
-    out = [f for f in fails if not str(f).startswith("dup:")]
+    rv = ctx.review
+    out = [f for f in ctx.fails if not str(f).startswith("dup:")]
+    for c in fix.code_issues(p):                                  # 정답·제공 코드가 완성되지 않았으면 이유를 알려 다시 쓰게 한다 (막는 문제는 ctx.fails 에 이미 있다)
+        if fix.CODE_ISSUE_MSG[c] not in out: out.append(fix.CODE_ISSUE_MSG[c])
+    if fix.type_mismatch(p) and not any("유형" in str(x) for x in (rv.get("확인필요") or [])) and fix.TYPE_MISMATCH_MSG not in out:
+        out.append(fix.TYPE_MISMATCH_MSG)                         # 한 번 다시 쓰게 한다 (프로그램을 쓰는 문제가 맞으면 AI 가 확인필요에 이유를 적어 넘어간다)
     if p.get("problemType") == "디버깅" and any("base_code" in str(f) for f in out):
         out.append("base_code: 디버깅 문제의 제공 코드(문제에 주어진 코드)는 base_code [{language, code, is_main:false}] 에 넣고, reference_codes 에는 제공 코드까지 포함한 전체 정답 코드를 넣으세요. 설명에서는 그 코드 블록을 뺍니다.")
     if p.get("problemType") in ("코딩", "디버깅") and p.get("reference_codes") and not p.get("test_cases") and not any(w in " ".join(map(str, rv.get("확인필요") or [])) + " ".join(map(str, rv.get("참고") or [])) for w in ("매번 달라", "그래픽", "난수", "실행마다")):
@@ -384,7 +469,7 @@ async def _fill_code(rows, rec, ai_fn, wants_info, calls):
             if code:
                 p["base_code"] = [{"language": lang or "python", "code": code, "is_main": False}]; p["description"] = rest; n += 1
                 rv["정리"] = list(rv.get("정리") or []) + [{"항목": "base_code", "변경": "AI 가 비운 제공 코드를 설명의 코드 블록에서 서버가 옮김", "이유": "디버깅 문제는 제공 코드가 필요함"}]
-        if not p.get("reference_codes") and lang:
+        if (not p.get("reference_codes") or fix.reference_incomplete(p)) and lang:           # 비었거나, 빈칸이 남았거나, 제공 코드를 담지 않은 정답 코드는 완성해서 채운다
             kw, info, t0 = {"system": fix.CODE_SYSTEM}, {}, time.time()
             if wants_info: kw["info"] = info
             try:
@@ -393,10 +478,65 @@ async def _fill_code(rows, rec, ai_fn, wants_info, calls):
                 logger.warning("정답 코드 호출 실패 %s: %s", rec.get("key"), e); got = None
             finally:
                 _log_call(calls, rec.get("key"), "정답 코드", time.time() - t0, info)
-            if got:
+            if got and not (p.get("reference_codes") and fix.code_placeholders(got[0].get("code"), lang)):      # 새로 받은 코드에도 빈칸이 있으면 쓰지 않는다 (기존 코드를 지키고 막힘·승인 이유로 알린다)
                 p["reference_codes"] = got; n += 1
                 rv["채움"] = [x for x in (rv.get("채움") or []) if not (isinstance(x, dict) and x.get("항목") == "reference_codes")] + [{"항목": "reference_codes", "내용": "제공 코드까지 포함한 전체 정답 코드", "근거": "설명과 제공 코드", "검증": "손 추적"}]
     return n
+
+async def _fill_cases(rows, rec, ai_fn, wants_info, calls):
+    """코딩·디버깅 결과의 테스트 케이스가 최소 개수(fix.MIN_CASES = 3)보다 적고 정답 코드가 입력을 읽으면, 모자란 만큼 입력만 다른 케이스를 짧은 호출로 AI 에게 제안받아 review.추가케이스 에 둔다.
+    값은 저장 단계(pipeline 의 extend_cases)가 정답 코드 실행 출력(실행이 켜진 경우) 또는 AI 가 손으로 추적한 값으로 확인해 더한다. 입력이 없는 프로그램은 호출하지 않는다(extend_cases 가 처리). 실패해도 문제 처리는 계속한다."""
+    for r in rows:
+        p, rv = (r or {}).get("payload"), (r or {}).get("review")
+        if not isinstance(p, dict) or not isinstance(rv, dict) or not fix.reads_input(p): continue
+        have = [x for x in (rv.get("추가케이스") or []) if isinstance(x, dict)]
+        for _try in range(3):                                      # 제안이 모자라거나 겹치면 다시 (이미 나온 입력은 피하게 알려 준다. 최대 3번)
+            n = fix.extra_cases_needed(p) - len({str(x.get("input")).strip() for x in have} - {str(t.get("input")).strip() for t in p.get("test_cases") or [] if isinstance(t, dict)})
+            if n <= 0: break
+            kw, info, t0 = {"system": fix.META_SYSTEM}, {}, time.time()
+            if wants_info: kw["info"] = info
+            try:
+                meta = fix.parse_meta(await _timed(lambda: ai_fn(fix.meta_request_payload(p, ["extra_cases"], n + 2, avoid=[x.get("input") for x in have]), **kw)))
+            except Exception as e:
+                logger.warning("테스트 케이스 추가 호출 실패 %s: %s (그대로 둠)", rec.get("key"), e); break
+            finally:
+                _log_call(calls, rec.get("key"), "추가 케이스", time.time() - t0, info)
+            if not meta.get("추가케이스"): break
+            have = have + meta["추가케이스"]
+        if have: rv["추가케이스"] = have
+
+async def _review_description(rows, rec, ai_fn, wants_info, calls):
+    """설명 검수: 서버 규칙이 이미 설명에서 무언가를 뺐거나, 코드·구역 의심이 남은 문제에만(모든 문제에는 하지 않는다) 짧은 호출로 AI 에게 '문제를 푸는 데 필요 없어 보이는 줄'을 표시하게 한다.
+    결과는 review.설명검수 에 두고 삭제하지 않는다(pipeline.classify 가 승인 이유로 안내). 엑셀 입력은 건드리지 않는다. 실패해도 문제 처리는 계속한다."""
+    if (rec or {}).get("입력종류") == "엑셀": return
+    for r in rows:
+        p, rv = (r or {}).get("payload"), (r or {}).get("review")
+        if not isinstance(p, dict) or not isinstance(rv, dict) or not isinstance(p.get("description"), str) or not p["description"].strip(): continue
+        probe = {"id": r.get("id"), "payload": copy.deepcopy(p), "review": copy.deepcopy(rv)}
+        try: fix.correct(rec, probe)                                   # 저장 때 서버가 할 보정을 미리 해 보고, 그 뒤의 설명을 검수한다
+        except Exception: continue
+        cp = probe["payload"] or {}
+        desc = cp.get("description") or ""
+        if not desc.strip() or not (fix.description_changed(p["description"], desc) or fix.description_residue(rec, cp)): continue
+        kw, info, t0 = {"system": fix.REVIEW_SYSTEM}, {}, time.time()
+        if wants_info: kw["info"] = info
+        try:
+            found = fix.parse_review(await _timed(lambda: ai_fn(fix.review_request(desc), **kw)), desc)
+        except Exception as e:
+            logger.warning("설명 검수 호출 실패 %s: %s (건너뜀)", rec.get("key"), e); found = []
+        finally:
+            _log_call(calls, rec.get("key"), "설명 검수", time.time() - t0, info)
+        if found: rv["설명검수"] = found
+
+async def _fill_code_cases_review(rows, rec, ai_fn, wants_info, calls):
+    """정답 코드·테스트 케이스를 채운 뒤(설명 보정에 쓰이므로) 설명 검수를 한다."""
+    await _fill_code_and_cases(rows, rec, ai_fn, wants_info, calls)
+    if config._flag("INTAKE_REVIEW_DESC", "on"): await _review_description(rows, rec, ai_fn, wants_info, calls)
+
+async def _fill_code_and_cases(rows, rec, ai_fn, wants_info, calls):
+    """정답 코드를 먼저 채우고(비어 있을 때), 그 코드로 모자란 테스트 케이스를 제안받는다 (케이스 제안은 정답 코드가 있어야 한다)."""
+    if config.fill_code(): await _fill_code(rows, rec, ai_fn, wants_info, calls)
+    if config.fill_cond(): await _fill_cases(rows, rec, ai_fn, wants_info, calls)
 
 async def _fill_meta(rows, rec, ai_fn, wants_info, calls):
     """부제목·문제의도가 빠진 문제마다 짧은 메타 호출로 AI 가 문제를 보고 채운다 (채움에 '미검증' 으로 기록, 등록할 때 설명 화면의 칸에 들어간다). 실패해도 문제 처리는 계속한다."""
@@ -504,10 +644,12 @@ async def _handle(ctx, item_id):
             kw = {"images": im} if im else {}                              # 그림이 있으면 함께 보낸다 (AI 함수가 images 를 받는 경우만)
             if wants_info: kw["info"] = info
             call = (lambda u: ai_fn(u, **kw)) if kw else ai_fn
+            if im: await pipeline.IMAGE_GATE.enter()                       # 그림이 붙은 호출만 동시 수를 따로 제한한다 (메모리). 글만 있는 호출은 그대로
             t0 = time.time()
             try:
                 return await _timed(call, user_text(r, mode) + extra)
             finally:
+                if im: pipeline.IMAGE_GATE.leave()
                 _log_call(calls, rec.get("key"), why, time.time() - t0, info)
         try:
             imgs = attached_images(rec); used = (rec, imgs)
@@ -563,8 +705,8 @@ async def _handle(ctx, item_id):
         finally:
             keep.cancel()
         fills = []                                                                       # 정답 코드 채우기와 부제목·의도 채우기는 서로 독립이라 동시에 한다 (한 문제의 호출이 줄줄이 이어지는 시간을 줄임)
-        if parsed and wants_system and config.fill_code():
-            fills.append(_fill_code(parsed, rec, ai_fn, wants_info, calls))                    # 다시 쓰기로도 비어 있는 제공 코드·정답 코드를 채운다
+        if parsed and wants_system and (config.fill_code() or config.fill_cond() or config._flag("INTAKE_REVIEW_DESC", "on")):
+            fills.append(_fill_code_cases_review(parsed, rec, ai_fn, wants_info, calls))          # 다시 쓰기로도 비어 있는 제공 코드·정답 코드를 채우고, 테스트 케이스가 3개보다 적으면 모자란 만큼 제안받는다
         if parsed and wants_system and config.fill_meta():
             fills.append(_fill_meta(parsed, rec, ai_fn, wants_info, calls))                    # 부제목·문제의도가 빠졌으면 짧은 호출로 채운다
         if fills: await asyncio.gather(*fills)
@@ -582,6 +724,7 @@ async def _process(job_id, ai_fn):
         job = await db.get(IntakeJob, job_id)
         if not job: return
         maker_id, mode, auto = job.maker_id, (job.options or {}).get("mode", "none"), (job.options or {}).get("auto_register", True)
+        plan = (job.options or {}).get("files") or []                 # 파일별 문제 번호 범위 (commit 뒤에는 읽을 수 없으니 먼저 꺼낸다)
         job.status, job.message, job.heartbeat_at = "processing", None, _now()
         await db.commit()
         if ai_fn is None:
@@ -593,8 +736,10 @@ async def _process(job_id, ai_fn):
             except OSError:
                 return await _stop(db, job_id, "failed", "프롬프트 파일을 읽을 수 없습니다. 관리자에게 문의하세요. (INTAKE_PROMPT_PATH)")
         seen = await _seen_hashes(db, job_id)
-        todo = (await db.execute(select(IntakeItem.item_id).where(IntakeItem.job_id == job_id, IntakeItem.status == PENDING,
-                                                                 IntakeItem.record.is_not(None)).order_by(IntakeItem.seq))).scalars().all()
+        rows_todo = (await db.execute(select(IntakeItem.item_id, IntakeItem.seq).where(IntakeItem.job_id == job_id, IntakeItem.status == PENDING,
+                                                                                      IntakeItem.record.is_not(None)).order_by(IntakeItem.seq))).all()
+        todo = [r[0] for r in rows_todo]
+        seq_of = {r[0]: r[1] for r in rows_todo}
         lock = asyncio.Lock()                                # 한 DB 세션을 여러 문제가 동시에 쓰지 않도록 (AI 호출만 동시에 진행한다)
         sem = asyncio.Semaphore(max(1, config.concurrency()))
         calls = []                                           # 호출마다 (문제, 이유, 걸린 시간, 입력 토큰, 출력 토큰) — 작업이 끝나면 요약을 로그에 남긴다
@@ -605,29 +750,50 @@ async def _process(job_id, ai_fn):
         prefetch = {}                                        # item_id -> 묶음 호출에서 받은 그 문제의 결과 글 (있으면 첫 호출을 건너뛴다)
         ctx = types.SimpleNamespace(ai_fn=ai_fn, auto=auto, calls=calls, db=db, exec_on=exec_on, job_id=job_id, lock=lock, maker_id=maker_id, mode=mode, prefetch=prefetch, seen=seen, sem=sem, state=state, todo=todo, wants_info=wants_info, wants_system=wants_system)                    # 아래 두 함수(_run_batches, _handle)가 쓰는 값 묶음
 
-        await _run_batches(ctx)
-        recs = {}
-        if len(todo) >= 4:
-            try:
-                recs = dict((await db.execute(select(IntakeItem.item_id, IntakeItem.record).where(IntakeItem.item_id.in_(todo)))).all())
-            except Exception:
-                logger.exception("문제 입력 조회 실패(순서 정렬·캐시 데우기를 건너뜀)")
-        warm = []
-        if config.warmup() and config.concurrency() > 1 and recs:
-            groups = {}
-            for iid in todo:
+        async def run_group(todo):
+            """한 파일(또는 전체)의 문제를 AI 로 처리한다. ctx.todo 를 이 묶음으로 바꿔 아래 단계들이 그 문제들만 다룬다."""
+            ctx.todo = todo
+            await _run_batches(ctx)
+            recs = {}
+            if len(todo) >= 4:
+                try:
+                    recs = dict((await db.execute(select(IntakeItem.item_id, IntakeItem.record).where(IntakeItem.item_id.in_(todo)))).all())
+                    for iid, r in list(recs.items()):                                        # 순서 정렬·캐시 데우기에는 그림 자체가 필요 없다: 크기만 남기고 base64 는 버려 작업 전체의 그림이 메모리에 한꺼번에 올라와 있지 않게 한다
+                        if isinstance(r, dict) and r.get("이미지"):
+                            recs[iid] = {**{k: v for k, v in r.items() if k != "이미지"}, "이미지": [{"n": 0}], "_w": len(json.dumps(r["이미지"]))}
+                except Exception:
+                    logger.exception("문제 입력 조회 실패(순서 정렬·캐시 데우기를 건너뜀)")
+            warm = []
+            if config.warmup() and config.concurrency() > 1 and recs:
+                groups = {}
+                for iid in todo:
+                    r = recs.get(iid) or {}
+                    if config.light_rows() and fix.light_payload(r, mode): continue                  # 가벼운 호출은 짧은 프롬프트라 데울 것이 없다
+                    groups.setdefault((_batch_key(r), bool(r.get("이미지"))), []).append(iid)
+                warm = [g[0] for g in groups.values() if len(g) >= 4]                                 # 같은 프롬프트로 4문제 이상일 때만
+            if warm:
+                logger.info("프롬프트 캐시 데우기: %d개 프롬프트의 첫 문제를 먼저 처리", len(warm))
+                await asyncio.gather(*(_handle(ctx, i) for i in warm))                                      # 프롬프트가 서로 다르므로 동시에: 앞부분(지시문)이 캐시에 올라간 뒤 나머지를 처리한다
+            warmed = set(warm)
+            def weight(iid):                                                                          # 무거운 문제(글이 길거나 방식이 여러 개라 출력이 긴 것)를 먼저 시작해야 마지막에 혼자 남는 긴 호출이 줄어든다
                 r = recs.get(iid) or {}
-                if config.light_rows() and fix.light_payload(r, mode): continue                  # 가벼운 호출은 짧은 프롬프트라 데울 것이 없다
-                groups.setdefault((_batch_key(r), bool(r.get("이미지"))), []).append(iid)
-            warm = [g[0] for g in groups.values() if len(g) >= 4]                                 # 같은 프롬프트로 4문제 이상일 때만
-        if warm:
-            logger.info("프롬프트 캐시 데우기: %d개 프롬프트의 첫 문제를 먼저 처리", len(warm))
-            await asyncio.gather(*(_handle(ctx, i) for i in warm))                                      # 프롬프트가 서로 다르므로 동시에: 앞부분(지시문)이 캐시에 올라간 뒤 나머지를 처리한다
-        warmed = set(warm)
-        def weight(iid):                                                                          # 무거운 문제(글이 길거나 방식이 여러 개라 출력이 긴 것)를 먼저 시작해야 마지막에 혼자 남는 긴 호출이 줄어든다
-            r = recs.get(iid) or {}
-            return len(json.dumps(r, ensure_ascii=False)) + 3000 * len((r.get("intake") or {}).get("방식표기") or [])
-        await asyncio.gather(*(_handle(ctx, i) for i in sorted((x for x in todo if x not in warmed), key=weight, reverse=True)))
+                return len(json.dumps(r, ensure_ascii=False)) + r.get("_w", 0) + 3000 * len((r.get("intake") or {}).get("방식표기") or [])
+            await asyncio.gather(*(_handle(ctx, i) for i in sorted((x for x in todo if x not in warmed), key=weight, reverse=True)))
+
+        groups = []
+        if len(plan) > 1:                                     # 파일이 여럿이면 파일 하나씩 차례로 처리하고, 끝나면 다음 파일로 넘어간다 (결과도 파일마다 나온다)
+            for f in plan:
+                ids = [i for i in todo if f["from"] <= seq_of[i] <= f["to"]]
+                if ids: groups.append((f["name"], ids))
+        if not groups: groups = [(None, todo)]
+        for gname, ids in groups:
+            if len(plan) > 1:
+                jb = await db.get(IntakeJob, job_id)
+                jb.options = {**(jb.options or {}), "current_file": gname}
+                await db.commit()
+                logger.info("파일 처리 시작: %s (%d문제)", gname, len(ids))
+            await run_group(ids)
+            if state["stop"]: break
         _log_summary(calls, job_id)
         if state["stop"]: return await _stop(db, job_id, *state["stop"])
         await _stop(db, job_id, None, None)
@@ -647,28 +813,20 @@ async def _store_rows(db, job_id, first_item_id, seq, rec, rows, seen, exec_on, 
     ids = []
     for idx, r in enumerate(rows):
         r["review"] = r.get("review") or {}
-        if exec_on and r.get("payload"):                                    # AI 가 손으로 추적한 기대 출력을 정답 코드의 실제 실행 출력으로 채움 (모델에 따라 틀리는 값을 서버가 바로잡는다)
-            await asyncio.to_thread(fix.fill, r["payload"], r["review"], checker.run_code, checker.norm_out)
-        fix.correct(rec, r)                                                    # 형식 바로잡기·원문 복원·설명 정리 등 서버 보정 전부 (AI·DB 호출 없음. 시험 도구도 같은 함수를 씀)
-        if r.get("payload"):
-            await asyncio.to_thread(fix.extend_cases, r["payload"], r["review"], checker.run_code, checker.norm_out, exec_on)      # 입력을 받는 코드인데 테스트 케이스가 1개뿐이면 입력만 다른 케이스를 2개까지 더함
-            suggest.apply_conditions(r["payload"], r["review"])               # AI 가 제안한 조건(사용 기능·출력형식)을 정답 코드·기대 출력과 맞는지 확인하고 자동으로 더함
-        fix.finish(rec, r)                                                     # 그림 올림 표시·거짓 경고 지우기·제목 되돌리기·서술형 답 비우기
-        case = {"id": r["id"], "payload": r.get("payload"), "review": r.get("review") or {}, "record": rec}
-        if rec.get("원본조각"): case["원본조각"] = rec["원본조각"]
-        if rec.get("이미지"): case["그림있음"] = True          # 그림에서 옮긴 설명 글은 원본 글에 없으므로 설명 대조를 완화한다
-        status, fails, warns, reasons = classify(case, seen, exec_on)
-        await _give_code_title(db, case["payload"], case["review"])      # 제목을 영문·숫자 코드로 (중복 검사 classify 는 원래 제목으로 이미 끝났다)
-        fix.fix_example_ref(rec, case["payload"], case["review"])         # 옮겨진 예시를 가리키던 말(np1 배열과 같이 → 출력 결과와 같이)을 고침: 원본 대조 검사 뒤에 고쳐야 '원본과 다름'으로 막히지 않는다
+        ctx = await asyncio.to_thread(pipeline.run, pipeline.Ctx(rec=rec, row=r, exec_on=exec_on, seen=seen))      # 서버 보정 → 검사 → 분류 (checks/pipeline.py 의 STAGES. 시험 도구도 같은 단계를 씀)
+        status, fails, warns, reasons = ctx.status, ctx.fails, ctx.warns, ctx.reasons
+        payload, review = r.get("payload"), r["review"]
+        await _give_code_title(db, payload, review)      # 제목을 영문·숫자 코드로 (중복 검사 classify 는 원래 제목으로 이미 끝났다)
+        fix.fix_example_ref(rec, payload, review)         # 옮겨진 예시를 가리키던 말(np1 배열과 같이 → 출력 결과와 같이)을 고침: 원본 대조 검사 뒤에 고쳐야 '원본과 다름'으로 막히지 않는다
         if idx == 0:
             it = await db.get(IntakeItem, first_item_id)
         else:
             it = IntakeItem(job_id=job_id, seq=seq, out_index=idx, source_key=str(rec["key"]), record=None)
             db.add(it)
-        it.result_id, it.payload, it.review = str(r["id"]), case["payload"], case["review"]
+        it.result_id, it.payload, it.review = str(r["id"]), payload, review
         it.check_fails, it.check_warns, it.approval_reasons, it.status, it.error = fails, warns, reasons, status, None
         await db.flush()
-        ids.append((it.item_id, status, case["payload"]))
+        ids.append((it.item_id, status, payload))
     await db.commit()
     for item_id, status, payload in ids:                # 깨끗한 것만 자동 등록
         if status == READY and auto:
@@ -679,49 +837,8 @@ async def _store_rows(db, job_id, first_item_id, seq, rec, rows, seen, exec_on, 
 # ----------------------------------------------------------------------------------------------------
 
 # ---------------------------------------------------------------- 검사 결과 분류
-def _runnable(payload):
-    return bool(payload) and payload.get("problemType") in ("코딩", "디버깅") and payload.get("test_cases") and payload.get("reference_codes")
-
-def classify(case, seen, exec_on):
-    """(상태, 검사 실패, 검사 경고, 승인 필요 이유)"""
-    fails, warns = checker.check_case(case, seen, skip_exec=not exec_on)
-    review, payload = case.get("review") or {}, case.get("payload")
-    if review.get("상태") == "보류" or payload is None:
-        return (BLOCKED if fails else HELD), fails, warns, []
-    if fails:
-        return BLOCKED, fails, warns, []
-    if fix.needs_input(payload):
-        return NEEDS_INPUT, fails, warns, [fix.REASON]
-    gaps = fix.test_case_gaps(payload)
-    reasons = []
-    notes = review.get("확인필요") or []
-    if notes: reasons.append(f"AI가 사람이 확인할 것 {len(notes)}건을 표시했습니다.")
-    if any(fix.UNSURE_TYPE_RE.search(str(n)) for n in notes):
-        reasons.append("문제 유형이 5가지(코딩·디버깅·객관식·단답형·주관식)에 딱 맞지 않아 가장 가까운 유형으로 넣었습니다. 유형을 확인하세요.")
-    if config.ai_answer_review() and (payload or {}).get("problemType") in ("객관식", "단답형") and {"correct_answers", "answer_text"} & set(fix.ai_filled(review)):
-        reasons.append("AI 가 직접 푼 정답입니다(손으로 따라간 값이라 실행으로 확인할 수 없고 틀릴 수 있음). 정답을 확인하세요.")
-    up = [g["n"] for g in (review.get("그림") or []) if isinstance(g, dict) and g.get("올림")]
-    if up: reasons.append(f"문제에 올릴 그림 {len(up)}장(번호 {up}: 출력 예시·개념)이 있습니다. 정답이 보이지 않는지 확인하고 올리세요.")
-    for w in warns:
-        if str(w).startswith("ref:"): reasons.append("정답 코드에 제공 코드가 거의 들어 있지 않습니다. 제공 코드까지 포함한 전체 코드인지 확인하세요."); break
-    r = checker.answer_leak_reason(payload)
-    if r: reasons.append(r)
-    r = checker.dup_option_reason(payload)
-    if r: reasons.append(r)
-    r = echo_reason(warns)
-    if r: reasons.append(r)
-    r = fidelity_reason(case.get("record"), payload)
-    if r: reasons.append(r)
-    if (review.get("제목정보") or {}).get("주제번호확실") is False:
-        reasons.append("제목 코드의 주제 번호를 문제 ID에서 찾지 못해 0으로 했습니다. 등록 제목(" + str(review["제목정보"].get("등록제목")) + ")의 주제 번호를 확인하세요.")
-    if _runnable(payload):
-        if not exec_on:
-            reasons.append("정답 코드를 서버에서 실행해 확인하지 않았습니다.")
-        else:                                           # 실행 환경이 없는 언어(java 등)는 실행 검증을 건너뛰므로 사람이 확인
-            skipped = sorted({str(w).split(":", 1)[1].strip() for w in warns if str(w).startswith("exec:") and "실행 환경 없음" in str(w)})
-            if skipped: reasons.append(f"정답 코드를 실행해 확인하지 못했습니다 ({', '.join(skipped)}).")
-    if gaps: return NEEDS_INPUT, fails, warns, gaps + reasons                          # 테스트 케이스 입력·출력 빈칸은 사람이 채워야 승인 가능
-    return (NEEDS_REVIEW if reasons else READY), fails, warns, reasons
+_runnable = pipeline.runnable                  # 이름 호환 (옛 코드·시험이 service._runnable / service.classify 를 쓴다)
+classify = pipeline.classify_case
 
 # ----------------------------------------------------------------------------------------------------
 # 4. 등록 · 승인
@@ -845,8 +962,8 @@ async def approve(db, job_id, maker_id, item_ids=None, edits=None):
 # ----------------------------------------------------------------------------------------------------
 
 # ---------------------------------------------------------------- 조회·승인·수정
-def item_out(it, with_record=False):
-    d = {"item_id": it.item_id, "seq": it.seq, "out_index": it.out_index, "source_key": it.source_key, "result_id": it.result_id,
+def item_out(it, with_record=False, plan=None):
+    d = {"file": file_of(plan, it.seq), "item_id": it.item_id, "seq": it.seq, "out_index": it.out_index, "source_key": it.source_key, "result_id": it.result_id,
          "status": it.status, "payload": it.payload, "review": it.review, "check_fails": it.check_fails or [],
          "check_warns": it.check_warns or [], "approval_reasons": it.approval_reasons or [], "problem_id": it.problem_id,
          "error": it.error, "edited": it.edited, "ai_filled": ai_filled(it.review)}
@@ -869,15 +986,38 @@ def suggest_conditions(it, form=None, current=None):
 _CAPTURE_LOCK = asyncio.Lock()                                  # 문서 변환(LibreOffice)은 한 번에 하나씩
 
 
-async def capture_job(job_id, files, records):
-    """올린 문서를 쪽 이미지로 만들어 저장하고, 문제마다 어느 쪽인지 기록한다 (AI 처리와 따로 백그라운드로). 실패해도 처리에는 영향 없다."""
-    if not config.capture() or not files: return
+async def capture_jobs(entries, workdir=None):
+    """업로드에서 만든 작업들의 원본 캡처를 차례로 한다. entries: [(job_id, [(이름, 확장자, 임시 파일 경로)])]. 끝나면(꺼져 있어도) 임시 폴더를 지운다."""
+    try:
+        for job_id, files in entries:
+            if files: await capture_job(job_id, files, None)
+    finally:
+        if workdir:
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
+
+async def capture_job(job_id, files, records=None, workdir=None):
+    """올린 문서를 쪽 이미지로 만들어 저장하고, 문제마다 어느 쪽인지 기록한다 (AI 처리와 따로 백그라운드로). 실패해도 처리에는 영향 없다.
+    files 의 내용(세 번째 값)은 바이트이거나 임시 파일 경로이다. 경로이면 캡처할 때 읽고, 끝나면 workdir(임시 폴더)를 지운다 (업로드 원본을 메모리에 오래 두지 않음)."""
     res = None
     try:
+        if not config.capture() or not files: return
+        if records is None:                                          # 레코드를 들고 있지 않고 저장된 입력에서 읽는다 (그림은 캡처에 필요 없다)
+            async with session_scope() as db:
+                rows = (await db.execute(select(IntakeItem.record).where(IntakeItem.job_id == job_id, IntakeItem.record.is_not(None)))).scalars().all()
+            records = [{k: v for k, v in r.items() if k != "이미지"} for r in rows if isinstance(r, dict)]
         async with _CAPTURE_LOCK:
-            res = await asyncio.to_thread(capture_mod.capture, files, records, config.capture_pages(), config.capture_dpi())
+            def _read():
+                return [(n, e, open(d, "rb").read() if isinstance(d, str) else d) for n, e, d in files]
+            def _go():
+                return capture_mod.capture(_read(), records, config.capture_pages(), config.capture_dpi())
+            res = await asyncio.to_thread(_go)
     except Exception:
         logger.exception("원본 캡처 실패: %s", job_id)
+    finally:
+        if workdir:
+            import shutil
+            shutil.rmtree(workdir, ignore_errors=True)
     try:
         async with session_scope() as db:
             if config.capture_days():                                      # 보관 기간이 지난 캡처 지우기

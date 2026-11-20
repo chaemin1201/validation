@@ -1,5 +1,5 @@
 """원본 문제지(PDF)를 문제 단위로 나누고 사전 점검한다. (원본만 받는 경로의 입력 준비)"""
-import re, subprocess, unicodedata
+import os, re, subprocess, unicodedata
 
 from . import images as safety      # 업로드 파일 안전 점검(images.py 안)
 
@@ -154,6 +154,7 @@ def docx_text(path, images=None):
     from docx.table import Table
     from docx.text.paragraph import Paragraph
     d = docx.Document(path)
+    raw = safety.RawBudget()                                  # 그림 원본을 메모리에 두는 한도
     num_to_abs, abstract = _numbering(d)
     counters = {}
 
@@ -173,20 +174,67 @@ def docx_text(path, images=None):
             out = out.replace(f"%{i + 1}", _fmt_num(c.get(i, abstract[num_to_abs[nid]].get(i, (0, 0, 1))[2]), abstract[num_to_abs[nid]].get(i, ("decimal",))[0]))
         return out
 
+    W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    A_ = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+    V_ = "{urn:schemas-microsoft-com:vml}"
+    MC = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+    R_ = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+    def live(el):
+        """같은 그림을 대체용으로 한 번 더 넣어 둔 mc:Fallback 안의 것은 세지 않는다."""
+        return not any(a.tag == MC + "Fallback" for a in el.iterancestors())
+
+    def pic_rids(p):
+        """문단 안의 그림마다 그림 부품 번호(없으면 None)를 차례로. 묶음 그림은 안의 그림마다 하나씩."""
+        out = []
+        for el in p._p.iter(W + "drawing", W + "pict"):
+            if not live(el) or any(a.tag in (W + "drawing", W + "pict") for a in el.iterancestors()):
+                continue                                        # 그림 틀 안에 또 있는 틀(글상자 속 그림 등)은 바깥 틀에서 함께 센다
+            rids = [b.get(R_ + "embed") or b.get(R_ + "link") for b in el.iter(A_ + "blip")] + [b.get(R_ + "id") for b in el.iter(V_ + "imagedata")]
+            rids = [x for x in rids if x]
+            if not rids and next(el.iter(W + "txbxContent"), None) is not None: continue   # 글상자뿐인 틀은 그림이 아니다 (글은 box_lines 가 읽는다)
+            out += rids or [None]                               # 차트·SmartArt 처럼 그림 부품이 없는 것도 자리는 하나 남긴다
+        return out
+
+    def box_lines(p):
+        """글상자(텍스트 상자) 안의 글. p.text 에는 들어 있지 않다."""
+        lines = []
+        for tb in p._p.iter(W + "txbxContent"):
+            if not live(tb) or any(a.tag == W + "txbxContent" for a in tb.iterancestors()): continue
+            for q in tb.iter(W + "p"):
+                t = "".join(x.text or "" for x in q.iter(W + "t")).replace("\xa0", " ").strip()
+                if t: lines.append(t)
+        return lines
+
     def para(p):
         t = p.text.replace("\xa0", " ")
-        pics = p._p.xpath(".//w:drawing | .//w:pict")
-        if pics:
-            t = (t + (" " + IMG_MARK) * len(pics)).strip()
+        rids = pic_rids(p)
+        if rids:
+            t = (t + (" " + IMG_MARK) * len(rids)).strip()
             if images is not None:
-                for el in pics:
-                    rid = (el.xpath(".//a:blip/@r:embed") or el.xpath(".//v:imagedata/@r:id") or [None])[0]
-                    try: images.append(p.part.related_parts[rid].blob if rid else None)
+                for rid in rids:
+                    try:
+                        blob = p.part.related_parts[rid].blob if rid else None
+                        images.append(blob if blob is not None and raw.take(len(blob)) else None)         # 너무 크거나 이미 한도를 넘었으면 건너뜀 ([이미지] 표시 자리는 유지)
                     except Exception: images.append(None)
         lab = label(p)
-        return (lab + " " + t).rstrip() if lab and t.strip() else t
+        t = (lab + " " + t).rstrip() if lab and t.strip() else t
+        extra = box_lines(p)
+        return "\n".join([t] + extra) if extra and t.strip() else "\n".join(extra) if extra else t
 
     out = []
+
+    def blocks(parent):
+        """문단·표를 차례로. 내용 컨트롤(w:sdt) 등으로 싼 것도 풀어서 낸다."""
+        for el in parent.iterchildren():
+            tag = el.tag
+            if tag in (W + "p", W + "tbl"): yield el
+            elif tag in (W + "sdt", W + "customXml", W + "smartTag", W + "ins", W + "moveTo"):
+                inner = el.find(W + "sdtContent")
+                yield from blocks(inner if inner is not None else el)
+            elif tag == MC + "AlternateContent":
+                ch = el.find(MC + "Choice")
+                if ch is not None: yield from blocks(ch)
 
     def table(t, sink, depth=0):
         for row in t.rows:
@@ -195,16 +243,16 @@ def docx_text(path, images=None):
                 if id(c._tc) in seen: continue                 # 병합된 칸은 한 번만
                 seen.add(id(c._tc))
                 lines = []
-                for el in c._tc.iterchildren():
-                    if el.tag.endswith("}p"): lines.append(para(Paragraph(el, c)))
-                    elif el.tag.endswith("}tbl") and depth < 3:
+                for el in blocks(c._tc):
+                    if el.tag == W + "p": lines.append(para(Paragraph(el, c)))
+                    elif depth < 3:
                         sub = []; table(Table(el, c), sub, depth + 1); lines += sub
                 cells.append("\n".join(lines).rstrip())
             sink.append(cells[0] if len(cells) == 1 else "   ".join(x.replace("\n", " ") for x in cells))
 
-    for el in d.element.body.iterchildren():
-        if el.tag.endswith("}p"): out.append(para(Paragraph(el, d)))
-        elif el.tag.endswith("}tbl"): table(Table(el, d), out)
+    for el in blocks(d.element.body):
+        if el.tag == W + "p": out.append(para(Paragraph(el, d)))
+        else: table(Table(el, d), out)
     return "\n".join(out)
 
 
@@ -213,6 +261,7 @@ def pptx_text(path, images=None):
     import zipfile, posixpath
     from xml.etree import ElementTree as ET
     safety.check_zip(path)
+    raw = safety.RawBudget()
     A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
     P = "{http://schemas.openxmlformats.org/presentationml/2006/main}"
     R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
@@ -251,7 +300,7 @@ def pptx_text(path, images=None):
                     if images is not None:
                         blip = next(c.iter(A + "blip"), None)
                         tgt = rl.get(blip.get(R + "embed")) if blip is not None else None
-                        images.append(z.read(tgt[1]) if tgt and tgt[1] in names else None)
+                        images.append(z.read(tgt[1]) if tgt and tgt[1] in names and raw.take(z.getinfo(tgt[1]).file_size) else None)      # 읽기 전에 크기를 보고 한도를 넘으면 읽지 않음
                 elif c.tag == P + "grpSp":
                     walk(c, sink, rl)
 
@@ -309,8 +358,24 @@ POPPLER_HELP = ("PDF 를 읽으려면 poppler 의 pdftotext 가 필요합니다.
                 "환경변수 POPPLER_PATH 에 폴더를 적으세요.")
 
 
+_TEXT_CACHE = {}                                              # (경로, 수정 시각, 크기) → 읽은 글. 최근 3개만: 문제로 나눈 뒤 같은 파일의 글이 다시 필요할 때(강의자료 판별 등) 다시 읽지 않는다
+
+
 def read_text(path, images=None):
-    """PDF / DOCX / HWP / HWPX / TXT / MD 에서 텍스트를 읽는다."""
+    """PDF / DOCX / HWP / HWPX / TXT / MD 에서 텍스트를 읽는다. 그림을 꺼내는 호출(images 목록을 넘김)이 아닌 반복 호출은 보관한 글을 돌려준다."""
+    try:
+        st = os.stat(path); key = (path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if images is None and key is not None and key in _TEXT_CACHE: return _TEXT_CACHE[key]
+    out = _read_text_raw(path, images)
+    if key is not None and isinstance(out, str):
+        while len(_TEXT_CACHE) >= 3: _TEXT_CACHE.pop(next(iter(_TEXT_CACHE)))
+        _TEXT_CACHE[key] = out
+    return out
+
+
+def _read_text_raw(path, images=None):
     low = path.lower()
     if low.endswith((".hwp", ".hwpx")):
         try:

@@ -45,7 +45,7 @@ def max_file_bytes():
 
 
 def max_files():
-    return _int("INTAKE_MAX_FILES", 5)
+    return _int("INTAKE_MAX_FILES", 3)
 
 
 def max_problems():
@@ -127,6 +127,11 @@ def whole_doc():
     return _flag("INTAKE_WHOLE_DOC", "off")
 
 
+def lecture_problems():
+    """강의자료 한 파일에서 AI 가 만드는 문제 수 (업로드 때 count 로 바꿀 수 있음, 1~10). INTAKE_LECTURE_PROBLEMS, 기본 5."""
+    return max(1, min(10, _int("INTAKE_LECTURE_PROBLEMS", 5)))
+
+
 def whole_doc_chars():
     return _int("INTAKE_WHOLE_DOC_CHARS", 24000)
 
@@ -152,8 +157,8 @@ def ai_answer_review():
 
 
 def daily_problems():
-    """한 사용자가 하루(서버 시간 0시 기준)에 올릴 수 있는 문제 수. AI 호출 비용과 남용을 막는다. 0 이면 제한 없음. INTAKE_DAILY_PROBLEMS, 기본 500."""
-    return max(0, _int("INTAKE_DAILY_PROBLEMS", 500))
+    """한 사용자가 하루(서버 시간 0시 기준)에 올릴 수 있는 문제 수. AI 호출 비용과 남용을 막는다. 0 이면 제한 없음. INTAKE_DAILY_PROBLEMS, 기본 300(파일 3개 × 문제 30~40개 안팎을 하루 몇 번 올릴 정도)."""
+    return max(0, _int("INTAKE_DAILY_PROBLEMS", 300))
 
 
 def daily_jobs():

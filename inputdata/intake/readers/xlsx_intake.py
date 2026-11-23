@@ -1,5 +1,5 @@
 """엑셀로 정리된 문제를 읽어 문제(행) 하나씩의 레코드로 만들고, 등록 필수 항목이 비어 있는지 점검한다."""
-import json, re
+import json, os, re
 
 
 class _LazyOpenpyxl:
@@ -57,6 +57,219 @@ def canon(header):
     return None
 
 
+MAX_SHEET_ROWS = 20000                      # 시트 하나에서 읽는 줄 수의 상한 (INTAKE_MAX_SHEET_ROWS). 문제 한 줄은 문제 하나이므로 이보다 많으면 문제표가 아니다
+MAX_SHEET_COLS = 60                         # 한 줄에서 읽는 칸 수의 상한
+
+
+def _max_rows():
+    try: return max(100, int(os.environ.get("INTAKE_MAX_SHEET_ROWS", MAX_SHEET_ROWS)))
+    except ValueError: return MAX_SHEET_ROWS
+
+
+class _LiteCell:
+    __slots__ = ("value", "column")
+    def __init__(self, value, column): self.value, self.column = value, column
+
+
+class _LiteSheet:
+    """읽기 전용으로 한 줄씩 읽어 값만 담은 시트 (openpyxl 의 일반 모드는 칸마다 객체를 만들어 큰 엑셀이 메모리를 수백 MB~수 GB 쓴다).
+    find_header · read 가 쓰는 ws.title / ws.max_row / ws.cell(r, c).value / ws[r] 만 같은 모양으로 준다."""
+    def __init__(self, title, rows):
+        self.title, self._rows, self.max_row = title, rows, len(rows)
+
+    def _row(self, r): return self._rows[r - 1] if 1 <= r <= len(self._rows) else ()
+
+    def cell(self, r, c):
+        row = self._row(r)
+        return _LiteCell(row[c - 1] if 1 <= c <= len(row) else None, c)
+
+    def __getitem__(self, r): return [_LiteCell(v, i) for i, v in enumerate(self._row(r), 1)]
+
+    def iter_rows(self, values_only=False): return iter(self._rows)
+
+
+def _lite_sheets(path):
+    """[(시트 이름, _LiteSheet)]. 줄은 한 줄씩 읽고, 뒤쪽의 빈 줄(서식만 남은 줄)은 담지 않으며, 줄 수가 상한을 넘으면 거절한다."""
+    limit = _max_rows()
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    out = []
+    try:
+        for ws in wb.worksheets:
+            rows, pending, kept = [], 0, 0
+            for row in ws.iter_rows(values_only=True):
+                row = tuple(row[:MAX_SHEET_COLS])
+                if all(v is None or (isinstance(v, str) and not v.strip()) for v in row):
+                    pending += 1; continue
+                rows.extend(() for _ in range(pending)); pending = 0
+                rows.append(row); kept += 1
+                if len(rows) > limit:
+                    raise SystemExit(f"{ws.title}: 표가 너무 큽니다 (줄 {limit}개 초과). 문제 표가 아닌 큰 데이터가 들어 있지 않은지 확인하세요 (INTAKE_MAX_SHEET_ROWS 로 바꿀 수 있습니다).")
+            out.append((ws.title, _LiteSheet(ws.title, rows)))
+    finally:
+        wb.close()
+    return out
+
+
+_NS_MAIN = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+_NS_R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+_NS_XDR = "{http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing}"
+_NS_A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+_NS_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+MAX_PICS_PER_ROW = 8                       # 한 줄(문제)에 붙이는 그림 수
+
+
+def _rels(z, path):
+    """관계 파일(.rels)의 {id: (종류 끝부분, 목표 경로)}. 없으면 {}."""
+    import xml.etree.ElementTree as ET
+    if path not in z.namelist(): return {}
+    out = {}
+    for r in ET.fromstring(z.read(path)).iter(_NS_REL + "Relationship"):
+        out[r.get("Id")] = ((r.get("Type") or "").rsplit("/", 1)[-1], r.get("Target") or "")
+    return out
+
+
+def _resolve(base_dir, target):
+    import posixpath
+    return posixpath.normpath(target.lstrip("/")) if target.startswith("/") else posixpath.normpath(posixpath.join(base_dir, target))
+
+
+_NS_RD = "{http://schemas.microsoft.com/office/spreadsheetml/2017/richdata}"
+_NS_RD2 = "{http://schemas.microsoft.com/office/spreadsheetml/2017/richdata2}"
+
+
+def _col_index(ref):
+    """'AB12' 의 열 번호(1부터)와 줄 번호."""
+    m = re.match(r"^([A-Za-z]+)(\d+)$", ref or "")
+    if not m: return None, None
+    col = 0
+    for ch in m.group(1).upper(): col = col * 26 + ord(ch) - 64
+    return col, int(m.group(2))
+
+
+def _inline_image_map(z, names):
+    """셀에 직접 넣은 그림(엑셀 365 '셀에 배치', 값이 #VALUE! 로 보임): {vm 번호: 그림 파일 경로}. 파일 안의 richData 를 따라간다 (셀 vm → 메타데이터 → 리치 값 → 그림 관계 → media). 없으면 {}."""
+    import xml.etree.ElementTree as ET
+    need = ("xl/metadata.xml", "xl/richData/rdrichvalue.xml", "xl/richData/richValueRel.xml")
+    if not all(n in names for n in need): return {}
+    try:
+        # 리치 값 구조: 구조 번호 → 'LocalImageIdentifier' 가 몇 번째 키인지
+        key_pos = {}
+        if "xl/richData/rdrichvaluestructure.xml" in names:
+            for i, st in enumerate(ET.fromstring(z.read("xl/richData/rdrichvaluestructure.xml")).iter(_NS_RD + "s")):
+                ks = [k.get("n") for k in st.iter(_NS_RD + "k")]
+                key_pos[i] = next((j for j, n in enumerate(ks) if n and "LocalImageIdentifier" in n), 0)
+        rich = []                                              # 리치 값 번호 → 관계 목록에서의 위치
+        for rv in ET.fromstring(z.read("xl/richData/rdrichvalue.xml")).iter(_NS_RD + "rv"):
+            vs = [v.text for v in rv.iter(_NS_RD + "v")]
+            pos = key_pos.get(int(rv.get("s") or 0), 0)
+            rich.append(int(vs[pos]) if pos < len(vs) and (vs[pos] or "").lstrip("-").isdigit() else None)
+        rel_ids = [r.get(_NS_R + "id") for r in ET.fromstring(z.read("xl/richData/richValueRel.xml")) if r.get(_NS_R + "id")]
+        rels = _rels(z, "xl/richData/_rels/richValueRel.xml.rels")
+        # 메타데이터: 셀의 vm(1부터) → valueMetadata 의 bk → rc.v → futureMetadata 의 rvb.i(리치 값 번호)
+        md = ET.fromstring(z.read("xl/metadata.xml"))
+        fut = []
+        for fm in md.iter(_NS_MAIN + "futureMetadata"):
+            if fm.get("name") == "XLRICHVALUE":
+                for bk in fm.iter(_NS_MAIN + "bk"):
+                    rvb = next(bk.iter(_NS_RD + "rvb"), None)
+                    fut.append(int(rvb.get("i")) if rvb is not None and (rvb.get("i") or "").isdigit() else None)
+        out = {}
+        for n, bk in enumerate(next(md.iter(_NS_MAIN + "valueMetadata"), []), 1):
+            rc = next(bk.iter(_NS_MAIN + "rc"), None)
+            if rc is None: continue
+            fi = int(rc.get("v") or 0)
+            ri = fut[fi] if fi < len(fut) else None
+            rel_pos = rich[ri] if ri is not None and ri < len(rich) else None
+            rid = rel_ids[rel_pos] if rel_pos is not None and rel_pos < len(rel_ids) else None
+            if rid in rels: out[n] = _resolve("xl/richData", rels[rid][1])
+        return out
+    except (KeyError, ET.ParseError, ValueError, IndexError, AttributeError, TypeError):
+        return {}
+
+
+def _inline_cells(z, sheet_path):
+    """한 시트에서 vm 속성이 있는 칸 [(줄, 열, vm)]. 시트 xml 을 한 칸씩 읽는다 (통째로 올리지 않음)."""
+    import xml.etree.ElementTree as ET
+    out = []
+    with z.open(sheet_path) as fh:
+        for _ev, el in ET.iterparse(fh, events=("end",)):
+            if el.tag == _NS_MAIN + "c":
+                vm = el.get("vm")
+                if vm and vm.isdigit():
+                    col, row = _col_index(el.get("r"))
+                    if col: out.append((row, col, int(vm)))
+                el.clear()
+            elif el.tag == _NS_MAIN + "row":
+                el.clear()
+    return out
+
+
+def sheet_pictures(path, with_cells=False):
+    """엑셀 시트에 놓인 그림을 {(시트 이름, 엑셀 줄 번호): [그림 바이트]} 로. 그림이 놓인 칸(왼쪽 위 모서리)의 줄 기준이고 같은 줄에서는 왼쪽 칸부터이다.
+    파일 안의 xml 만 읽는다(openpyxl 로 통째로 올리지 않음). 그림 하나 10MB·엑셀 하나 80MB 를 넘으면 건너뛴다. 그림이 없거나 읽을 수 없으면 {}."""
+    import xml.etree.ElementTree as ET, zipfile
+    if not str(path).lower().endswith((".xlsx", ".xlsm")): return {}
+    budget = safety.RawBudget()
+    out, cells = {}, set()
+    ret = (lambda: (out, cells)) if with_cells else (lambda: out)
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            if not any(n.startswith("xl/media/") for n in names): return ret()
+            inline = _inline_image_map(z, names)
+            wb_rels = _rels(z, "xl/_rels/workbook.xml.rels")
+            for sh in ET.fromstring(z.read("xl/workbook.xml")).iter(_NS_MAIN + "sheet"):
+                kind_target = wb_rels.get(sh.get(_NS_R + "id"))
+                if not kind_target: continue
+                sheet_path = _resolve("xl", kind_target[1])
+                if inline and sheet_path in names:                               # 셀 안 그림: 칸에 붙은 그림을 그 줄에 넣고, 칸 값(#VALUE!)은 표시해 둔다
+                    for row, col, vm in _inline_cells(z, sheet_path):
+                        media = inline.get(vm)
+                        if not media or media not in names: continue
+                        cells.add((sh.get("name"), row, col))
+                        if len(out.get((sh.get("name"), row), [])) >= MAX_PICS_PER_ROW or not budget.take(z.getinfo(media).file_size): continue
+                        out.setdefault((sh.get("name"), row), []).append(z.read(media))
+                srels = _rels(z, sheet_path.rsplit("/", 1)[0] + "/_rels/" + sheet_path.rsplit("/", 1)[1] + ".rels")
+                for _id, (kind, target) in srels.items():
+                    if kind != "drawing": continue
+                    dpath = _resolve(sheet_path.rsplit("/", 1)[0], target)
+                    if dpath not in names: continue
+                    drels = _rels(z, dpath.rsplit("/", 1)[0] + "/_rels/" + dpath.rsplit("/", 1)[1] + ".rels")
+                    found = []
+                    for anchor in ET.fromstring(z.read(dpath)):
+                        frm = anchor.find(_NS_XDR + "from")
+                        blip = next(anchor.iter(_NS_A + "blip"), None)
+                        if frm is None or blip is None: continue
+                        rel = drels.get(blip.get(_NS_R + "embed"))
+                        if not rel: continue
+                        try: found.append((int(frm.find(_NS_XDR + "row").text) + 1, int(frm.find(_NS_XDR + "col").text), _resolve(dpath.rsplit("/", 1)[0], rel[1])))
+                        except (AttributeError, TypeError, ValueError): continue
+                    for row, _col, media in sorted(found):
+                        if media not in names or len(out.get((sh.get("name"), row), [])) >= MAX_PICS_PER_ROW: continue
+                        if not budget.take(z.getinfo(media).file_size): continue
+                        out.setdefault((sh.get("name"), row), []).append(z.read(media))
+    except (zipfile.BadZipFile, KeyError, ET.ParseError, OSError, ValueError):
+        return ret()
+    return ret()
+
+
+def _attach_pictures(path, out, include_examples):
+    """read() 가 만든 행들에 시트 속 그림을 붙인다(blobs). 그림이 문제 줄이 아닌 칸(머리글·빈 줄)에 놓였으면 바로 위의 문제 줄에 붙인다."""
+    pics = sheet_pictures(path)
+    if not pics: return
+    by_sheet = {}
+    for rec in out:
+        title = rec["source"].rsplit(":", 1)[-1]
+        by_sheet.setdefault(title, []).append(rec)
+    for (title, row), blobs in pics.items():
+        recs = by_sheet.get(title) or []
+        target = None
+        for rec in recs:
+            if rec["row"] <= row and (target is None or rec["row"] > target["row"]): target = rec          # 그림이 놓인 줄 이하에서 가장 가까운 문제 줄
+        if target is not None and row - target["row"] <= 30:
+            target.setdefault("blobs", []).extend(blobs[:MAX_PICS_PER_ROW])
+
+
 def find_header(ws, scan=12):
     for r in range(1, scan + 1):
         mapped = {c.column: canon(c.value) for c in ws[r] if canon(c.value)}
@@ -108,9 +321,22 @@ SKIP_SHEETS = {"안내", "예시", "설명"}      # 템플릿의 안내·예시 
 def _csv_rows(path):
     """CSV/TSV 를 읽어 (머리글 행 번호, 열 매핑, 행 목록) 형태로 돌려준다."""
     import csv
-    delim = "\t" if path.lower().endswith((".tsv", ".tab")) else ","
     import io
-    return list(csv.reader(io.StringIO(safety.read_text_file(path), newline=""), delimiter=delim))      # UTF-8·UTF-16·CP949 모두 읽는다
+    text = safety.read_text_file(path)                                    # UTF-8·UTF-16·CP949 모두 읽는다
+    delim = "\t" if path.lower().endswith((".tsv", ".tab")) else ","
+    if delim == ",":                                                      # .csv 라도 엑셀 설정(지역)에 따라 세미콜론·탭으로 저장될 수 있다: 머리글 줄이 가장 많이 나뉘는 구분자를 쓴다
+        head = next((ln for ln in text.splitlines() if ln.strip()), "")
+        best = max((",", ";", "\t"), key=lambda d: len(next(csv.reader([head], delimiter=d), [])))
+        if len(next(csv.reader([head], delimiter=best), [])) >= 2: delim = best
+    limit, rows, pending = _max_rows(), [], 0                            # 줄을 한꺼번에 목록으로 만들지 않고 한 줄씩 담는다: 뒤쪽 빈 줄은 담지 않고, 줄 수가 상한을 넘으면 거절한다 (엑셀과 같은 규칙)
+    for row in csv.reader(io.StringIO(text, newline=""), delimiter=delim):
+        if not any(str(c).strip() for c in row):
+            pending += 1; continue
+        rows.extend([] for _ in range(pending)); pending = 0
+        rows.append(row[:MAX_SHEET_COLS])
+        if len(rows) > limit:
+            raise SystemExit(f"표가 너무 큽니다 (줄 {limit}개 초과). 문제 표가 아닌 큰 데이터가 들어 있지 않은지 확인하세요 (INTAKE_MAX_SHEET_ROWS 로 바꿀 수 있습니다).")
+    return rows
 
 
 DUP_NAME_MEMO = "같은 이름이 여러 번 나옴 "      # 프롬프트의 보류 조건("같은 이름이 중복됨")이 이 메모를 보고 판단한다. AI 는 문제를 하나씩만 보므로 서버가 알려 줘야 한다
@@ -254,14 +480,14 @@ def sheet_text(path, limit=300_000):
             if cells: lines.append("   ".join(cells))
     else:
         if str(path).lower().endswith((".xlsx", ".xlsm")): safety.check_zip(path)
-        wb = openpyxl.load_workbook(path, data_only=True)
-        for ws in wb:
+        sheets = _lite_sheets(path)
+        for title, ws in sheets:
             rows = []
             for row in ws.iter_rows(values_only=True):
                 cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
                 if cells: rows.append("   ".join(cells))
             if rows:
-                if len(wb.sheetnames) > 1: lines.append(ws.title)
+                if len(sheets) > 1: lines.append(title)
                 lines += rows
             if sum(len(x) + 1 for x in lines) > limit: break
     text = "\n".join(lines)
@@ -272,23 +498,26 @@ def read(path, include_examples=False):
     if path.lower().endswith((".csv", ".tsv", ".tab")): return read_csv(path)
     if str(path).lower().endswith(DB_EXT): return read_sqlite(path)
     if str(path).lower().endswith((".xlsx", ".xlsm")): safety.check_zip(path)        # 압축 폭탄 점검
-    wb = openpyxl.load_workbook(path, data_only=True)
+    sheets = _lite_sheets(path)
+    pic_cells = sheet_pictures(path, with_cells=True)[1] if str(path).lower().endswith((".xlsx", ".xlsm")) else set()      # 셀 안 그림 칸 (값이 #VALUE! 로 읽힘)
     out = []
-    for ws in wb:
+    for _title, ws in sheets:
         if ws.title in SKIP_SHEETS and not include_examples: continue
         try:
             hr, cols = find_header(ws)
         except SystemExit:
-            if len(wb.sheetnames) == 1: raise
+            if len(sheets) == 1: raise
             continue
         unknown = [str(c.value).strip() for c in ws[hr] if c.value not in (None, "") and str(c.value).strip() and c.column not in cols]   # 모르는 열은 버리지 말고 알린다
         for r in range(hr + 1, ws.max_row + 1):
             f = {}
             for col, key in cols.items():
                 v = ws.cell(r, col).value
+                if pic_cells and (ws.title, r, col) in pic_cells and isinstance(v, str) and v.startswith("#"): v = None       # 그림이 든 칸: 글이 아니라 그림이다
                 if v is not None and str(v).strip() != "": f[key] = str(v).strip()
             if not f.get("이름") and not f.get("설명"): continue           # 서식만 있는 빈 행
             it = intake_row(f, path)
             if unknown: it["메모"].append(UNKNOWN_COLS_MEMO + ", ".join(unknown))
             out.append({"source": f"{path.split('/')[-1]}:{ws.title}", "row": r, "fields": f, "intake": it})
+    _attach_pictures(path, out, include_examples)                         # 시트에 그림이 있으면 그 줄(문제)에 붙인다 (AI 입력·이미지 저장소)
     return mark_duplicate_names(out)

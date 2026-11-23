@@ -464,14 +464,87 @@ def pdf_image_pages(path, min_w=100, min_h=40):
     """그림(래스터)이 들어 있는 쪽 번호 집합. 로고·아이콘 같은 작은 그림은 뺀다. pdfimages 가 없거나 실패하면 빈 집합."""
     try:
         r = subprocess.run([poppler_exe("pdfimages") or "pdfimages", "-list", path], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+        if r.returncode != 0: return _pdfium_image_pages(path, min_w, min_h)
     except (OSError, subprocess.SubprocessError):
-        return set()
+        return _pdfium_image_pages(path, min_w, min_h)         # poppler 가 없으면 조용히 그림을 놓치지 않도록 pypdfium2 로 같은 일을 한다
     pages = set()
     for ln in r.stdout.splitlines()[2:]:
         c = ln.split()
         if len(c) > 4 and c[0].isdigit() and c[3].isdigit() and c[4].isdigit() and int(c[3]) >= min_w and int(c[4]) >= min_h and c[2] != "smask":
             pages.add(int(c[0]))
     return pages
+
+
+def _pdfium_image_pages(path, min_w=100, min_h=40):
+    """pdfimages(poppler) 대신 pypdfium2 로 그림(래스터)이 들어 있는 쪽 번호 집합을 구한다. 작은 그림(로고 등)은 뺀다. 못 열면 빈 집합."""
+    try:
+        import pypdfium2 as pdfium, pypdfium2.raw as praw
+    except ImportError:
+        return set()
+    pages = set()
+    try:
+        doc = pdfium.PdfDocument(path)
+    except Exception:
+        return pages
+    try:
+        for i in range(len(doc)):
+            pg = doc[i]
+            try:
+                for o in pg.get_objects():
+                    if o.type != praw.FPDF_PAGEOBJ_IMAGE: continue
+                    try:
+                        m = o.get_metadata()
+                        if m.width >= min_w and m.height >= min_h: pages.add(i + 1); break
+                    except Exception:
+                        pages.add(i + 1); break                 # 크기를 못 읽으면 놓치는 쪽보다 보내는 쪽이 안전하다
+            finally:
+                pg.close()
+    except Exception:
+        pass
+    finally:
+        doc.close()
+    return pages
+
+
+MAX_EMBED_PICS = 3                       # 한 문제에 붙이는 문서 속 그림 수
+_EMBED_MAX_PIXELS = 12_000_000           # 이보다 큰 그림은 꺼내지 않는다 (메모리)
+
+
+def embedded_pictures(path, pages, min_w=100, min_h=40, limit=MAX_EMBED_PICS):
+    """PDF 쪽들에서 문서 속 그림(래스터)을 그림 그대로 꺼내 PNG 바이트 목록으로 (쪽 순서·쪽 안 순서). 로고 같은 작은 그림과 너무 큰 그림은 뺀다. 꺼낼 수 없으면 빈 목록."""
+    try:
+        import io, pypdfium2 as pdfium, pypdfium2.raw as praw
+    except ImportError:
+        return []
+    out = []
+    try:
+        doc = pdfium.PdfDocument(path)
+    except Exception:
+        return out
+    try:
+        for pg_no in pages:
+            if len(out) >= limit: break
+            if not 1 <= pg_no <= len(doc): continue
+            pg = doc[pg_no - 1]
+            try:
+                for o in pg.get_objects():
+                    if len(out) >= limit: break
+                    if o.type != praw.FPDF_PAGEOBJ_IMAGE: continue
+                    try:
+                        m = o.get_metadata()
+                        if m.width < min_w or m.height < min_h or m.width * m.height > _EMBED_MAX_PIXELS: continue
+                        img = o.get_bitmap().to_pil()
+                        buf = io.BytesIO(); img.save(buf, "PNG"); out.append(buf.getvalue())
+                        img.close()
+                    except Exception:
+                        continue
+            finally:
+                pg.close()
+    except Exception:
+        pass
+    finally:
+        doc.close()
+    return out
 
 
 def _render_pdfium(path, page, dpi):
@@ -593,6 +666,16 @@ def sections(path, id_re=None, label=None):
 _MATH = "≤≥≠±√∑∫π∞θ"
 LOSSY_LINE_RE = re.compile(r"^.*[-].*[-].*$|^[ \t]*[" + _MATH + r"][ \t]*$|^.*[ \t]{12,}[" + _MATH + r"].*$|^.*[" + _MATH + r"][ \t]{12,}.*$", re.M)
 MAX_PAGE_PICS = 3                       # 한 문제에 붙이는 쪽 화면 수
+# 그림이 있는 쪽이라도 그 문제의 글이 그림을 가리키거나(다음 코드·다음과 같은·출력 예·그림 …) 글이 거의 없을 때만 쪽 화면을 보낸다.
+# 한 쪽에 문제가 여럿이면 같은 쪽 화면이 문제마다 되풀이되어 입력 토큰이 크게 늘기 때문이다 (그림과 상관없는 문제에는 보내지 않는다).
+_FIG_CUE = re.compile(r"다음\s*(?:과\s*같|의|코드|그림|표|출력|결과|프로그램|화면|클래스|메소드|함수)|아래|위의|위\s*(?:그림|코드|표)|그림|도형|표를|출력\s*(?:예|결과|화면|형식)|실행\s*(?:결과|화면)|예시|화면|\[이미지\]")
+_FIG_SHORT = 120                        # 공백 뺀 글자 수가 이보다 적으면 글만으로는 문제가 안 되므로 그림을 보낸다
+
+
+def needs_figure(body):
+    """이 문제의 글이 그림(쪽 화면)을 필요로 하는가."""
+    b = str(body or "")
+    return len(re.sub(r"\s+", "", b)) < _FIG_SHORT or bool(_FIG_CUE.search(b))
 
 
 def lossy_lines(text):
@@ -618,8 +701,11 @@ def sections_with_images(path, id_re=None, label=None, with_images=True):
             last_page = txt.count("", 0, max(end - 1, mend)) + 1
             raw = txt[mend:end]                                                # 수식이 글로 빠진 쪽도 화면을 보낸다 (그림 파일이 없는 PDF 에서 수식이 글꼴 조각으로 그려진 경우)
             lossy = {page + raw[:m.end()].count(chr(12)) for m in LOSSY_LINE_RE.finditer(raw)}      # 줄 끝까지 세야 줄 앞에 붙은 쪽 구분 문자가 포함된다
-            want = sorted((pdf_img_pages | lossy) & set(range(page, last_page + 1)))[:MAX_PAGE_PICS]
-            pics = [b for b in (render_pdf_page(path, pg) for pg in want) if b]
+            figs = (pdf_img_pages if needs_figure(body) else set()) & set(range(page, last_page + 1))      # 그림과 상관없어 보이는 문제에는 그림을 보내지 않는다
+            lossy &= set(range(page, last_page + 1))
+            emb = embedded_pictures(path, sorted(figs)) if figs else []                                    # 문서 속 그림은 그림 그대로 꺼낸다 (이미지 추가 항목·AI 입력). 쪽 전체 화면보다 작다
+            screens = sorted(lossy | (figs if not emb else set()))[:MAX_PAGE_PICS]                         # 쪽 전체 화면은 수식이 깨진 쪽이거나 그림을 꺼내지 못했을 때만
+            pics = [(b, "원본그림") for b in emb] + [(b, "쪽화면") for b in (render_pdf_page(path, pg) for pg in screens) if b]
         elif imgs and len(imgs) == txt.count(IMG_MARK):                      # 표시 개수와 그림 개수가 같을 때만 짝을 믿는다
             first = txt.count(IMG_MARK, 0, mend)
             pics = imgs[first: first + txt.count(IMG_MARK, mend, end)]

@@ -216,12 +216,12 @@ def _proposals(raw):
     return out
 
 
-MIN_KEEP = 2                                          # 문제에 조건이 이미 이만큼 있으면 자동으로 더하지 않는다 (0개·1개일 때만 더함)
-MAX_AUTO = 2                                          # 자동으로 더하는 조건은 문제당 최대 2개 (종류는 필수·금지·허용·출력형식 중 서로 다른 것)
+MIN_KEEP = 3                                          # 코딩·디버깅 문제의 조건은 이만큼(3개)이 되도록 채운다. 이미 3개 이상이면 더하지 않는다
+MAX_AUTO = 3                                          # 자동으로 더하는 조건의 상한 (입력에 조건이 0개면 3개, 1개면 2개, 2개면 1개를 더함. 종류는 필수·금지·허용·출력형식 중 서로 다른 것을 먼저)
 
 
 def apply_conditions(payload, review):
-    """코딩·디버깅 문제에 AI 가 정답 코드를 보고 판단한 조건을 최대 2개 자동으로 더한다 (제자리 수정). 더한 조건 글의 목록을 돌려준다."""
+    """코딩·디버깅 문제의 조건이 3개가 되도록 AI 가 정답 코드를 보고 판단한 조건을 자동으로 더한다 (제자리 수정). 더한 조건 글의 목록을 돌려준다."""
     rv = review if isinstance(review, dict) else {}
     proposed = _proposals(rv.pop("조건제안", None))
     p = payload if isinstance(payload, dict) else {}
@@ -230,11 +230,12 @@ def apply_conditions(payload, review):
     if not code.strip(): return []
     tcs = [t for t in (p.get("test_cases") or []) if isinstance(t, dict)]
     cur = [str(c) for c in (p.get("problem_condition") or [])]
-    if len(cur) >= MIN_KEEP: return []                              # 이미 조건이 2개 이상이면 더하지 않는다
+    if len(cur) >= MIN_KEEP: return []                              # 이미 조건이 3개 이상이면 더하지 않는다
+    room = min(MAX_AUTO, MIN_KEEP - len(cur))                       # 더할 수 있는 개수: 3 - 현재 조건 수
     added = []                                                      # (태그, 조건 글, 근거)
 
     def put(tag, text, why):
-        if len(added) >= MAX_AUTO or _dup(text, cur + [a[1] for a in added]): return False
+        if len(added) >= room or _dup(text, cur + [a[1] for a in added]): return False
         added.append((tag, text, why)); return True
 
     def verdict(tag, body):
@@ -251,15 +252,17 @@ def apply_conditions(payload, review):
     for tag, text, why in good:                                     # 서로 다른 종류를 먼저
         if tag not in kinds and put(tag, text, why): kinds.add(tag)
     for tag, text, why in good: put(tag, text, why)                 # 모자라면 같은 종류로
-    if len(added) < MAX_AUTO and not any(a[0] == "필수" for a in added):
+    if len(added) < room and not any(a[0] == "필수" for a in added):
         desc = str(p.get("description") or "")
         for text, reason, covers in _rules(code, tcs):
             if re.search(covers, " ".join(cur), re.I): continue
             if not re.search(covers, desc, re.I): continue          # 문제 설명이 말하지 않은 기능(map·for 같은 풀이 습관)을 규칙이 강제하지 않는다
             if put("필수", text, reason): break
-    if len(added) < MAX_AUTO and not any(a[0] == "출력형식" for a in added):
+    if len(added) < room and not any(a[0] == "출력형식" for a in added):
         r = _format_rule(tcs)
         if r: put("출력형식", r[0], r[1])
+    if len(added) < room and not any(a[0] == "허용" for a in added):          # AI 제안이 모자랄 때: 어느 문제에나 맞는 허용 조건 (변수·함수 이름)
+        put("허용", "[허용] 변수·함수 이름은 자유롭게 정할 수 있다", "기본 허용 조건 (정답 코드의 이름에 얽매이지 않음)")
     if not added: return []
     p["problem_condition"] = cur + [a[1] for a in added]
     if isinstance(review, dict):

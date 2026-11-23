@@ -56,6 +56,8 @@ def classify_case(case, seen, exec_on):
     review, payload = case.get("review") or {}, case.get("payload")
     if review.get("상태") == "보류" or payload is None:
         return (BLOCKED if fails else HELD), fails, warns, []
+    if fails and fix.short_answer_missing(payload) and all("answer_text" in str(f) for f in fails):
+        return NEEDS_INPUT, [], warns, [fix.SHORT_REASON]                # 정답만 비어 있는 단답형은 막지 않고 사람이 정답을 입력하게 한다
     if fails:
         return BLOCKED, fails, warns, []
     cf = fix.code_fails(payload)                             # 빈칸이 남은 정답 코드, 제공 코드에 노출된 정답은 등록하지 않는다
@@ -66,6 +68,11 @@ def classify_case(case, seen, exec_on):
     gaps = fix.test_case_gaps(payload)
     reasons = []
     if (case.get("record") or {}).get("강의자료"): reasons.append(fix.LECTURE_REASON)         # 강의자료에서 만든 문제는 항상 사람이 확인하고 승인한다 (자동 등록하지 않음)
+    rec_ = case.get("record") or {}
+    if rec_.get("스캔"):                                                                   # 글 층이 없는 스캔 문서: AI 가 그림을 읽어 옮기고 문제 경계도 정했으므로 항상 원본과 대조한다
+        reasons.append("스캔 문서를 AI 가 그림에서 읽어 옮긴 문제입니다. 코드·숫자·기호가 원본과 같은지, 문제 나눔이 맞는지 확인하세요.")
+    elif rec_.get("이미지"):                                                               # 그림(쪽 화면)으로 받은 내용이 있으면 AI 가 그림 속 코드·출력·글자를 옮겼을 수 있다
+        reasons.append("문제에 붙은 그림(쪽 화면)에서 AI 가 읽어 옮긴 내용이 있을 수 있습니다. 원본의 코드·출력 예시와 같은지 확인하세요.")
     notes = review.get("확인필요") or []
     if notes: reasons.append(f"AI가 사람이 확인할 것 {len(notes)}건을 표시했습니다.")
     if any(fix.UNSURE_TYPE_RE.search(str(n)) for n in notes):
@@ -73,7 +80,9 @@ def classify_case(case, seen, exec_on):
     if config.ai_answer_review() and (payload or {}).get("problemType") in ("객관식", "단답형") and {"correct_answers", "answer_text"} & set(fix.ai_filled(review)):
         reasons.append("AI 가 직접 푼 정답입니다(손으로 따라간 값이라 실행으로 확인할 수 없고 틀릴 수 있음). 정답을 확인하세요.")
     up = [g["n"] for g in (review.get("그림") or []) if isinstance(g, dict) and g.get("올림")]
-    if up: reasons.append(f"문제에 올릴 그림 {len(up)}장(번호 {up}: 출력 예시·개념)이 있습니다. 정답이 보이지 않는지 확인하고 올리세요.")
+    if review.get("그림연결") is not None and (payload or {}).get("image_url"):
+        reasons.append(f"문서 속 그림 {review['그림연결']} 을 문제 그림(image_url)으로 넣었습니다. 정답이 보이지 않는지 확인하세요.")
+    elif up: reasons.append(f"문제에 올릴 그림 {len(up)}장(번호 {up}: 개념·설명 그림)이 있습니다. 정답이 보이지 않는지 확인하고 올리세요.")
     for w in warns:
         if str(w).startswith("ref:"): reasons.append("정답 코드에 제공 코드가 거의 들어 있지 않습니다. 제공 코드까지 포함한 전체 코드인지 확인하세요."); break
     r = checker.answer_leak_reason(payload)
@@ -86,6 +95,8 @@ def classify_case(case, seen, exec_on):
     if r: reasons.append(r)
     r = fix.residue_reason(case.get("record"), payload)
     if r: reasons.append(r)
+    sp = fix.syntax_problem(payload)
+    if sp: reasons.append(f"정답 코드에 문법 오류가 있어 보입니다 ({sp}). 서버가 코드를 실행하지 않으므로 사람이 정답 코드를 확인하세요.")
     if "ref_lacks_base" in fix.code_issues(payload):         # 정답 코드가 제공 코드를 담지 않음: 사람이 승인 때 확인
         reasons.append("정답 코드가 제공 코드(문제에 주어진 코드)를 담고 있지 않습니다. 제공 코드까지 포함한 완성 코드인지 확인하세요.")
     r = fix.type_mismatch_reason(payload)                    # 물음에 답하는 문제인데 코딩으로 정해짐: 사람이 승인 때 유형을 확인

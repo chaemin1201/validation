@@ -21,6 +21,8 @@ class IntakeInputError(ValueError):
 
 def kind_of(name):
     low = name.lower()
+    allowed = config.allowed_exts()
+    if allowed is not None and not low.endswith(allowed): return None        # 허용하지 않은 형식 (읽는 코드는 남아 있고 INTAKE_FORMATS 로 다시 열 수 있다)
     if low.endswith(TABLE_EXT): return "table"
     if low.endswith(ORIGINAL_EXT): return "original"
     return None
@@ -80,9 +82,11 @@ def _original_records(prob_paths, sol_paths, id_re, names, split=True):
     recs = []
     for pid in order + [x for x in order_s if x not in sp]:
         page, body, fmt, pics = sp.get(pid) or ss[pid]
+        if pid in sp and pid in ss and ss[pid][3]:                       # 풀이 파일의 그림(정답 코드·실행 결과 화면일 수 있음)도 AI 에 보낸다. 문제 그림 칸에는 절대 올리지 않도록 '풀이그림' 으로 표시한다
+            pics = list(pics) + [((b[0] if isinstance(b, tuple) else b), "풀이그림") for b in ss[pid][3] if b]
         body, inline_ans = pdf_intake.clean_section(body)                 # 번호 잔재·구역 표시를 지우고, 문서 안의 '정답' 구역은 설명에서 떼어 정답자료로 보낸다
         att, notes = images.attach(pics) if pics and budget[0] > 0 else ([], ["작업 전체 그림 용량 한도를 넘어 이 문제의 그림은 붙이지 못했습니다"] if pics else [])
-        budget[0] -= sum(len(a["b64"]) for a in att)
+        budget[0] -= sum(images.weight(a) for a in att)
         parts = pdf_intake.split_subtasks(body) if split else [("", body)]               # 코드 작성·수정 소문항이 여럿이면 소문항마다 문제 하나로 (제공 코드 등 머리말은 모두에 붙음)
         expanded = []                                                                     # 풀이 방식(방법1, 방법2 …)이 둘 이상이면 방식마다 문제 하나로 (모두 작성이든 택1이든)
         for suffix, text in parts:
@@ -106,8 +110,12 @@ def _original_records(prob_paths, sol_paths, id_re, names, split=True):
                 memo.append(f"풀이 방식이 {n_methods}개라 서버가 문제 {n_methods}개로 나눔: 이 문제는 '{method}' 만 요구함 (분할하지 말고 이 방식 문제 하나만 출력, 다른 방식 안내와 '모두 작성'은 설명에서 뺌, 조건에 [필수] {method})")
             if att:
                 rec["이미지"] = att                                     # AI 호출에 붙이는 그림 (prompt_input 에서는 빼고 따로 붙인다)
+                sol_n = [a["n"] for a in att if a.get("종류") == "풀이그림"]
+                if sol_n: memo.append(f"풀이 파일의 그림 {len(sol_n)}개도 함께 보냄(번호 {sol_n}): 정답 코드·실행 결과 화면일 수 있음 → 코드는 정답 코드(reference_codes)로, 출력은 expected_output 으로 옮기고 문제 그림으로는 올리지 않음(정답이 보임)")
                 if fmt == "PDF":
-                    memo.append(f"그림이 있는 쪽 {len(att)}장을 쪽 전체 화면으로 함께 보냄: 같은 쪽의 다른 문제 내용이 섞여 있을 수 있고 [이미지] 표시와 번호가 대응하지 않음")
+                    pic_n = [a["n"] for a in att if a.get("종류") == "원본그림"]; scr_n = [a["n"] for a in att if a.get("종류") not in ("원본그림", "풀이그림")]
+                    if pic_n: memo.append(f"문서 속 그림 {len(pic_n)}개를 그림 그대로 함께 보냄(번호 {pic_n}): 출력 예시·개념 그림이면 문제 그림(올림)으로 쓸 수 있음")
+                    if scr_n: memo.append(f"쪽 전체 화면 {len(scr_n)}장을 함께 보냄(번호 {scr_n}): 같은 쪽의 다른 문제 내용이 섞여 있을 수 있고 [이미지] 표시와 번호가 대응하지 않음")
                 else:
                     memo.append(f"그림 {len(att)}개를 함께 보냄: 원본조각의 [이미지] 를 나온 순서대로 센 번호 {[a['n'] for a in att]}")
             rec["intake"]["메모"] = memo + notes
@@ -132,7 +140,7 @@ def _scan_records(paths, names, budget):
             b = min(a + step - 1, shown)
             blobs = [pdf_intake.render_pdf_page(path, pg, n_pages=n) for pg in range(a, b + 1)]
             att, notes = images.attach(blobs) if any(blobs) and budget[0] > 0 else ([], [])
-            budget[0] -= sum(len(x["b64"]) for x in att)
+            budget[0] -= sum(images.weight(x) for x in att)
             memo = [f"글 층이 없는 스캔 문서입니다({a}~{b}쪽). 그림을 AI 가 읽어 옮기므로 코드·숫자·기호를 잘못 읽을 수 있어 사람이 원본과 대조해야 함",
                     "문제 경계를 쪽 그림으로 판단함 → 나눈 결과(문제 수·범위)를 사람이 확인해야 함"]
             if n > shown and b == shown: memo.append(f"전체 {n}쪽 중 앞 {shown}쪽만 읽음 (INTAKE_SCAN_PAGES 로 늘릴 수 있음)")
@@ -277,20 +285,25 @@ def lecture_with_problems(path, recs):
     return False, False
 
 
-def _lecture_unit(path, label, idx, count=None, strict=False, quiz=False):
-    """문제가 아니라 강의자료인 파일: 글 전체를 읽어 레코드 하나(rec["강의자료"]=True)로 만든다. AI 는 이 내용에서 비슷한 새 문제 count 개를 만든다."""
-    try:
-        txt = pdf_intake.read_text(path)
-    except (SystemExit, Exception):
-        raise IntakeInputError("파일을 읽을 수 없습니다.")
+def _lecture_unit(path, label, idx, count=None, strict=False, quiz=False, text=None, extra=False):
+    """문제가 아니라 강의자료인 파일: 글 전체를 읽어 레코드 하나(rec["강의자료"]=True)로 만든다. AI 는 이 내용에서 비슷한 새 문제 count 개를 만든다.
+    text 를 주면 파일을 다시 읽지 않고 그 글을 쓴다. extra 는 문제 파일 안의 강의 설명 부분에서 문제를 더 만드는 경우이다."""
+    if text is None:
+        try:
+            txt = pdf_intake.read_text(path)
+        except (SystemExit, Exception):
+            raise IntakeInputError("파일을 읽을 수 없습니다.")
+    else:
+        txt = text
     txt = (txt or "").strip()
     if len(re.sub(r"\s+", "", txt)) < 200:
         raise IntakeInputError("읽을 수 있는 글이 너무 적어 강의자료로 처리할 수 없습니다(스캔·그림 문서일 수 있습니다).")
     if strict and not _lecture_like_text(txt):                    # 자동 판별: 문제 신호(입출력 예·'~하시오'·물음표 등)가 있으면 문제지이므로 강의자료로 보지 않는다
         raise IntakeInputError("문제 신호가 있어 강의자료로 보지 않습니다.")
-    n = max(1, min(10, int(count))) if count else config.lecture_problems()
+    n = max(1, min(10, int(count))) if count else (config.lecture_extra() if extra else config.lecture_problems())
     cap = config.whole_doc_chars()
-    memo = [f"문제가 아니라 강의자료로 보고 이 내용에서 비슷한 문제 {n}개를 AI 가 만듦 → 만들어진 문제는 모두 사람이 확인하고 승인해야 함"]
+    memo = [f"이 문제 파일 안의 강의 설명 부분에서 비슷한 문제 {n}개를 AI 가 더 만듦 (파일에 이미 있는 문제와 겹치지 않게) → 만들어진 문제는 모두 사람이 확인하고 승인해야 함"] if extra else \
+           [f"문제가 아니라 강의자료로 보고 이 내용에서 비슷한 문제 {n}개를 AI 가 만듦 → 만들어진 문제는 모두 사람이 확인하고 승인해야 함"]
     if len(txt) > cap:
         memo.append(f"강의자료가 길어 앞 {cap}자만 사용함")
         txt = txt[:cap]
@@ -301,11 +314,47 @@ def _lecture_unit(path, label, idx, count=None, strict=False, quiz=False):
     if lang: intake["언어힌트"] = lang
     rec = {"입력종류": "원본", "원본형식": pdf_intake.format_of(path), "key": key, "id": key, "page": 1, "원본조각": txt, "문서전체": True, "강의자료": True, "생성수": n,
            "intake": intake, "파일": label}
-    if quiz or split_quiz(txt)[1].strip() or _quiz_signals(txt) >= 3:
+    if not extra and (quiz or split_quiz(txt)[1].strip() or _quiz_signals(txt) >= 3):
         rec["확인학습"] = True                                       # 강의에 들어 있는 확인 학습(연습 문제·질문)도 문제로 함께 옮긴다
         memo.append("강의에 확인 학습(연습 문제·질문)이 있어 그 문제도 함께 옮김")
     rec = redact_records([rec])[0]                                # 학번·이름 칸, 전화번호 등 개인정보를 AI 에 보내기 전에 지운다 (문제 파일과 같은 규칙)
     return {"kind": "원본", "records": [rec], "files": [label], "original_idx": [idx]}
+
+
+_EXTRA_MIN_CHARS = 200                                       # 문제로 읽힌 줄을 뺀 나머지 강의 글이 공백 빼고 이만큼은 되어야 강의 설명이 함께 있다고 본다
+_EXTRA_PER_CHARS = 200                                       # 강의 글 이만큼(공백 뺀 글자)마다 문제 1개: 600자 이상이면 설정한 개수(기본 3), 그보다 짧으면 더 적게 (400자 → 2개, 200자 → 1개)
+
+
+def _lecture_remainder(path, recs):
+    """파일 글에서 문제로 읽힌 줄(본문·풀이)을 뺀 나머지가 강의 설명(공백 빼고 200자 이상이고 강의다운 글)이면 그 글, 아니면 None."""
+    try:
+        txt = pdf_intake.read_text(path) or ""
+    except (SystemExit, Exception):
+        return None
+    ws = lambda t: re.sub(r"\s+", "", t)
+    known = set()
+    for r in recs:
+        for t in (str(r.get("원본조각") or ""), str(r.get("정답자료") or "")):
+            known.update(ws(ln) for ln in t.splitlines() if len(ws(ln)) >= 3)
+    keys = {str(r.get("key")) for r in recs if len(str(r.get("key") or "")) >= 3}
+    def _title(ln):                                              # 문제 제목 줄('문제 PY11-0001', '실습 1.')은 본문에서 빠져 남으므로 강의 글에서도 뺀다
+        return any(k in ln for k in keys) or bool(pdf_intake.ID_RE.search(ln)) or bool(pdf_intake.HEADING_RE.match(ln.strip()))
+    rest_txt = chr(10).join(ln for ln in txt.splitlines() if ws(ln) and ws(ln) not in known and not _title(ln))
+    if len(ws(rest_txt)) < _EXTRA_MIN_CHARS or not _lecture_like_text(rest_txt): return None
+    return rest_txt
+
+
+def lecture_extra_unit(path, label, idx, recs):
+    """문제 파일인데 문제 사이·앞뒤에 강의 설명(개념·예제)이 충분히 함께 있으면, 문제로 읽힌 줄을 뺀 나머지 글로 강의 레코드를 만든다 (문제는 그대로 들어가고 이 레코드가 강의 내용에 맞는 문제를 더 만든다).
+    없으면 None. config.lecture_extra() 가 0 이면 만들지 않는다."""
+    if config.lecture_extra() <= 0 or not recs: return None
+    rest_txt = _lecture_remainder(path, recs)
+    if rest_txt is None: return None
+    n = max(1, min(config.lecture_extra(), len(re.sub(r"\s+", "", rest_txt)) // _EXTRA_PER_CHARS))       # 강의 글이 짧으면 만드는 문제도 적게
+    try:
+        return _lecture_unit(path, label, idx, n, strict=False, text=rest_txt, extra=True)
+    except IntakeInputError:
+        return None
 
 
 _SOL_TOKENS = re.compile(r"풀이|정답|해설|답안|solutions?|answers?|\bsol\b", re.I)
@@ -320,21 +369,41 @@ def _pair_key(label):
     return re.sub(r"[\s_\-().\[\]]+", "", stem).lower()
 
 
-def _group_originals(labels, idx):
-    """원본 파일 번호 목록 idx 를 '함께 처리해야 하는 묶음'으로 나눈다: 풀이(정답) 파일은 이름이 같은 문제 파일과 한 묶음, 나머지 파일은 파일마다 한 묶음.
-    짝을 이름으로 찾을 수 없는 풀이 파일이 있으면 옛 방식(풀이 자료를 문제 파일 전체와 공유)대로 전부 한 묶음으로 둔다."""
+def _ids_of(path):
+    try:
+        return set(pdf_intake.ID_RE.findall(pdf_intake.read_text(path) or ""))
+    except (SystemExit, Exception):
+        return set()
+
+
+def _same_set(label_a, path_a, label_b, path_b):
+    """이름으로는 짝이 아닌 풀이 파일과 문제 파일이 내용으로 같은 문제 묶음인가: 문서에 같은 문제 ID('문제 PY11-0001')가 있거나, 이름의 핵심 부분이 한쪽에 들어 있다."""
+    ka, kb = _pair_key(label_a), _pair_key(label_b)
+    if len(ka) >= 4 and len(kb) >= 4 and (ka in kb or kb in ka): return True
+    if path_a and path_b:
+        ids = _ids_of(path_a)
+        return bool(ids) and bool(ids & _ids_of(path_b))
+    return False
+
+
+def _group_originals(labels, idx, paths=None):
+    """원본 파일 번호 목록 idx 를 '함께 처리해야 하는 묶음'으로 나눈다 (파일마다 작업 하나가 원칙이다):
+    ① 풀이(정답) 파일은 이름이 같은 문제 파일과 한 묶음. ② 이름이 다른 풀이 파일은 내용으로 짝(같은 문제 ID 가 있거나 이름이 서로 들어 있음)을 찾고, 짝이 하나로 정해지지 않으면 풀이 파일도 혼자 한 묶음(그 파일 안의 문제를 읽는다).
+    ③ 나머지 파일은 파일마다 한 묶음. 서로 상관없는 파일을 한 작업에 섞지 않는다."""
+    path = (lambda i: paths[i]) if paths else (lambda i: None)
     prob = [i for i in idx if not is_solution(labels[i])]
     sol = [i for i in idx if is_solution(labels[i])]
-    if not prob: return [list(idx)] if idx else []
     groups = {}
     for i in prob: groups.setdefault(_pair_key(labels[i]), []).append(i)
-    left = []
+    alone = []
     for i in sol:
         k = _pair_key(labels[i])
-        if k in groups: groups[k].append(i)
-        else: left.append(i)
-    if left: return [list(idx)]
-    return sorted((sorted(g) for g in groups.values()), key=lambda g: g[0])
+        if k in groups:
+            groups[k].append(i); continue
+        cands = [key for key, g in groups.items() if _same_set(labels[i], path(i), labels[g[0]], path(g[0]))]
+        if len(cands) == 1: groups[cands[0]].append(i)
+        else: alone.append([i])
+    return sorted([sorted(g) for g in groups.values()] + alone, key=lambda g: g[0])
 
 
 def _table_ids(tables):
@@ -364,22 +433,25 @@ def iter_units(table_path=None, original_paths=(), pattern=None, labels=None, ta
     errors = errors if errors is not None else []
     excs, made = [], 0
     rest = list(range(len(originals)))
-    if tables:                                                    # 표와 짝이 되는 원본만 표와 함께, 나머지는 아래에서 파일마다
-        ids = _table_ids(tables)
-        paired = [i for i in rest if ids and _pairs_with_table(originals[i], ids)]
-        rest = [i for i in rest if i not in paired]
+    free = list(rest)
+    for ti, tp in enumerate(tables):                              # 표 파일도 파일마다 묶음 하나: 그 표의 문제 ID 가 들어 있는 원본만 그 표와 함께, 나머지는 아래에서 파일마다
+        tl = [tlabels[ti]] if ti < len(tlabels) else [os.path.basename(str(tp))]
+        ids = _table_ids([tp])
+        paired = [i for i in free if ids and _pairs_with_table(originals[i], ids)]
+        free = [i for i in free if i not in paired]
         unit = None
         try:
-            kind, recs = build_records(tables, [originals[i] for i in paired], pattern, [labels[i] for i in paired], tlabels)
-            names = [n for n in tlabels + [labels[i] for i in paired] if n]
+            kind, recs = build_records([tp], [originals[i] for i in paired], pattern, [labels[i] for i in paired], tl)
+            names = [n for n in tl + [labels[i] for i in paired] if n]
             tag = names[0] if len(names) == 1 else ", ".join(names)
             for r in recs: r["파일"] = tag
             unit = {"kind": kind, "records": recs, "files": names, "original_idx": paired}
         except IntakeInputError as e:
-            errors.append(f"{', '.join(tlabels)}: {e}"); excs.append(e)
+            errors.append(f"{', '.join(tl)}: {e}"); excs.append(e)
         if unit is not None:
             made += 1; yield unit; unit = None
-    for g in _group_originals(labels, rest):
+    rest = free
+    for g in _group_originals(labels, rest, originals):
         names = [labels[i] for i in g]
         unit = None
         try:
@@ -395,6 +467,12 @@ def iter_units(table_path=None, original_paths=(), pattern=None, labels=None, ta
                 if unit is None:
                     tag = names[0] if len(names) == 1 else ", ".join(names)
                     for r in recs: r["파일"] = tag
+                    if mat == "auto":                                                   # 문제 파일에 강의 설명도 들어 있으면 그 내용에 맞는 문제를 더 만든다
+                        pi = next((i for i in g if not is_solution(labels[i])), None)
+                        extra = lecture_extra_unit(originals[pi], labels[pi], pi, recs) if pi is not None else None
+                        if extra:
+                            for r in extra["records"]: r["파일"] = tag
+                            recs = recs + extra["records"]
                     unit = {"kind": kind, "records": recs, "files": names, "original_idx": list(g)}
         except IntakeInputError as e:
             if mat == "auto" and len(g) == 1 and _NO_PROBLEM in str(e):                # 문제를 못 찾은 파일: 문제 신호가 없으면 강의자료
@@ -478,13 +556,13 @@ def _build_records(table_path, original_paths, pattern, labels, table_labels, tm
             recs = [{"입력종류": "엑셀", "표형식": pdf_intake.format_of(r["_tp"]), "key": (r["fields"].get("이름") or f"행{r['row']}").replace("문제 ", ""),
                      "fields": r["fields"], "intake": r["intake"], "_row": r} for r in rows]
             budget = [images.job_budget()]
-            for rec, r in zip(recs, rows):                                   # DB 에 그림이 함께 담긴 문제는 그림도 AI 에 붙인다
+            for rec, r in zip(recs, rows):                                   # 엑셀·DB 에 그림이 함께 담긴 문제는 그림도 AI 에 붙인다
                 if not r.get("blobs"): continue
                 att, notes = images.attach(r["blobs"]) if budget[0] > 0 else ([], ["작업 전체 그림 용량 한도를 넘어 이 문제의 그림은 붙이지 못했습니다"])
-                budget[0] -= sum(len(a["b64"]) for a in att)
+                budget[0] -= sum(images.weight(a) for a in att)
                 if att:
                     rec["이미지"] = att
-                    notes = [f"DB 에 담긴 그림 {len(att)}개를 함께 보냄(번호 {[a['n'] for a in att]}). 실행 결과 화면이나 코드 화면일 수 있음"] + notes
+                    notes = [f"표(엑셀·DB)에 담긴 그림 {len(att)}개를 함께 보냄(번호 {[a['n'] for a in att]}). 출력 예시·코드 화면·설명 그림일 수 있음: 출력 예시는 글로 옮겨 test_cases 에 넣고 문제 그림 칸에는 올리지 않음"] + notes
                 rec["intake"]["메모"] = list(rec["intake"].get("메모") or []) + notes
             table_ids = {name_id(r["fields"].get("이름", "")) for r in rows} - {None}
             paired = [(p, l) for p, l in label_of if _pairs_with_table(p, table_ids)]
@@ -553,7 +631,8 @@ def _file_covered(path, recs):
     if not lines: return True
     big = chr(10).join(re.sub(r"\s+", "", str(r.get("원본조각") or "")) + re.sub(r"\s+", "", str(r.get("정답자료") or "")) for r in recs)
     hit = sum(1 for l in lines if l[-8:] in big)          # 제목 머리(실습 1. 등)는 정리돼 빠지므로 줄 끝부분으로 대조
-    return hit >= max(1, 0.15 * len(lines))                      # 파일 줄의 15% 이상이 어느 레코드에도 안 들어갔으면 그 파일은 버려진 것
+    if hit >= max(1, 0.15 * len(lines)): return True
+    return hit >= 1 and config.lecture_extra() > 0 and _lecture_remainder(path, recs) is not None      # 문제가 일부 읽혔고 나머지가 강의 설명이면 버려진 파일이 아니다 (강의 설명은 따로 문제를 만든다)
 
 
 def _whole_doc_records(paths, labels, names, only=None):

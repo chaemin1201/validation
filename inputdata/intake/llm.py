@@ -227,16 +227,26 @@ def _post(url, headers, body, timeout, waits, on_retry=None, stream=False):
         time.sleep(wait)
 
 
+def _b64(im):
+    """링크로 온 그림을 받아야 하는 곳(Gemini 는 링크를 받지 않음)에서 바이트로 바꾼다. MinIO 키가 있으면 거기서, 없으면 링크를 내려받는다."""
+    if im.get("b64"): return im["b64"]
+    import base64, urllib.request
+    if im.get("key"):
+        from .readers import imgstore
+        return imgstore.b64_of(im)
+    with urllib.request.urlopen(im["url"], timeout=30) as r: return base64.b64encode(r.read()).decode("ascii")
+
+
 def _call_one(provider, model, key, system, user, max_tokens, url, timeout, waits, on_retry, thinking=None, images=None):
     u = url(model) if callable(url) else (url.replace("{model}", model) if isinstance(url, str) else url)
     if provider == "anthropic":
-        content = user if not images else [{"type": "text", "text": user}] + [{"type": "image", "source": {"type": "base64", "media_type": im["mime"], "data": im["b64"]}} for im in images]
+        content = user if not images else [{"type": "text", "text": user}] + [{"type": "image", "source": ({"type": "url", "url": im["url"]} if im.get("url") else {"type": "base64", "media_type": im["mime"], "data": im["b64"]})} for im in images]
         body = {"model": model, "max_tokens": max_tokens, "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}], "messages": [{"role": "user", "content": content}]}
         resp = _post(u or ANTHROPIC_URL, {"content-type": "application/json", "x-api-key": key, "anthropic-version": "2023-06-01"}, body, timeout, waits, on_retry)
         return "".join(b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"), _usage(resp, "anthropic")
     if provider == "google":
         body = {"systemInstruction": {"parts": [{"text": system}]},
-                "contents": [{"role": "user", "parts": [{"text": user}] + [{"inline_data": {"mime_type": im["mime"], "data": im["b64"]}} for im in (images or [])]}],
+                "contents": [{"role": "user", "parts": [{"text": user}] + [{"inline_data": {"mime_type": im["mime"], "data": _b64(im)}} for im in (images or [])]}],
                 "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0}}
         if thinking is not None and str(thinking) != "":   # 생각(thinking) 정도 조절 (선택). 숫자면 thinkingBudget(2.5 계열), 글자면 thinkingLevel(3 계열)
             try: body["generationConfig"]["thinkingConfig"] = thinking_config(thinking)
@@ -252,7 +262,7 @@ def _call_one(provider, model, key, system, user, max_tokens, url, timeout, wait
             raise RuntimeError(f"Gemini 응답이 비어 있음 (finishReason={cands[0].get('finishReason')}). max_tokens 를 늘려 보세요. (생각 토큰이 출력 한도를 쓰는 경우가 많습니다: --thinking low)")
         return text, _usage(resp, "google")
     if provider == "openai":                                  # OpenAI 호환 (OpenAI, Groq, OpenRouter, Together, DeepSeek, Mistral, Azure 호환 주소 등)
-        content = user if not images else [{"type": "text", "text": user}] + [{"type": "image_url", "image_url": {"url": f"data:{im['mime']};base64,{im['b64']}"}} for im in images]
+        content = user if not images else [{"type": "text", "text": user}] + [{"type": "image_url", "image_url": {"url": im.get("url") or f"data:{im['mime']};base64,{im['b64']}"}} for im in images]
         sysmsg = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}] if os.environ.get("LLM_CACHE_CONTROL", "").strip().lower() in ("on", "1", "true") else system
         body = {"model": model, "messages": [{"role": "system", "content": sysmsg}, {"role": "user", "content": content}]}
         body[os.environ.get("LLM_MAX_TOKENS_PARAM") or "max_tokens"] = max_tokens          # 새 OpenAI 모델은 max_completion_tokens 를 요구한다

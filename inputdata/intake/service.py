@@ -27,7 +27,7 @@ from app.inputdata.schemas import format_validation_errors, problem_adapter
 from ..crud.inputdata import create_problem
 from . import config, llm
 from .checks import checker, pipeline
-from .readers import images as images_mod, capture as capture_mod
+from .readers import images as images_mod, capture as capture_mod, imgstore
 from .models import (EDITABLE, IntakeCapture, ProblemTitleSeq, extras, unwrap as unwrap_description, wrap as wrap_description, AI_FAILED, APPROVABLE, BLOCKED, DUPLICATE, HELD, NEEDS_INPUT, NEEDS_REVIEW, PENDING, PROCESSING,
                      READY, REGISTER_FAILED, REGISTERED, IntakeItem, IntakeJob)
 from .llm import parse_lines
@@ -97,11 +97,22 @@ async def delete_jobs(db, job_ids):
     """작업과 그 항목·캡처를 지운다 (등록된 문제는 그대로). 지운 작업 수."""
     ids = list(job_ids)
     if not ids: return 0
+    keys = await _image_keys(db, ids)
     await db.execute(delete(IntakeCapture).where(IntakeCapture.job_id.in_(ids)))
     await db.execute(delete(IntakeItem).where(IntakeItem.job_id.in_(ids)))
     await db.execute(delete(IntakeJob).where(IntakeJob.job_id.in_(ids)))
     await db.commit()
+    if keys: await asyncio.to_thread(imgstore.delete, keys)         # 이미지 저장소(MinIO)의 그림도 지운다. 못 지운 것은 저장소 수명 규칙이 지운다
     return len(ids)
+
+
+async def _image_keys(db, job_ids):
+    """작업들이 MinIO 에 둔 그림 키 (문제에 붙인 그림 + 쪽 캡처)."""
+    if not imgstore.enabled(): return []
+    keys = [imgstore.key_of(d) for d in (await db.execute(select(IntakeCapture.data).where(IntakeCapture.job_id.in_(job_ids)))).scalars().all()]       # 쪽 캡처 중 MinIO 에 둔 것(키)
+    for rec in (await db.execute(select(IntakeItem.record).where(IntakeItem.job_id.in_(job_ids), IntakeItem.record.is_not(None)))).scalars().all():
+        if isinstance(rec, dict): keys += imgstore.keys_in(rec)
+    return keys
 
 
 async def purge_old_jobs(db):
@@ -394,7 +405,8 @@ async def _precheck(row, rec, exec_on):
     rv = ctx.review
     out = [f for f in ctx.fails if not str(f).startswith("dup:")]
     for c in fix.code_issues(p):                                  # 정답·제공 코드가 완성되지 않았으면 이유를 알려 다시 쓰게 한다 (막는 문제는 ctx.fails 에 이미 있다)
-        if fix.CODE_ISSUE_MSG[c] not in out: out.append(fix.CODE_ISSUE_MSG[c])
+        msg = fix.CODE_ISSUE_MSG[c] + ((" (" + fix.syntax_problem(p) + ")") if c == "syntax_ref" else "")
+        if msg not in out: out.append(msg)
     if fix.type_mismatch(p) and not any("유형" in str(x) for x in (rv.get("확인필요") or [])) and fix.TYPE_MISMATCH_MSG not in out:
         out.append(fix.TYPE_MISMATCH_MSG)                         # 한 번 다시 쓰게 한다 (프로그램을 쓰는 문제가 맞으면 AI 가 확인필요에 이유를 적어 넘어간다)
     if p.get("problemType") == "디버깅" and any("base_code" in str(f) for f in out):
@@ -641,7 +653,7 @@ async def _handle(ctx, item_id):
         keep = asyncio.create_task(_keepalive(job_id))
         async def ask(r, im, extra="", why="처음"):
             info = {}
-            kw = {"images": im} if im else {}                              # 그림이 있으면 함께 보낸다 (AI 함수가 images 를 받는 경우만)
+            kw = {"images": imgstore.for_ai(im)} if im else {}            # 그림이 있으면 함께 보낸다 (MinIO 에 있으면 링크만. AI 함수가 images 를 받는 경우만)
             if wants_info: kw["info"] = info
             call = (lambda u: ai_fn(u, **kw)) if kw else ai_fn
             if im: await pipeline.IMAGE_GATE.enter()                       # 그림이 붙은 호출만 동시 수를 따로 제한한다 (메모리). 글만 있는 호출은 그대로
@@ -829,7 +841,7 @@ async def _store_rows(db, job_id, first_item_id, seq, rec, rows, seen, exec_on, 
         ids.append((it.item_id, status, payload))
     await db.commit()
     for item_id, status, payload in ids:                # 깨끗한 것만 자동 등록
-        if status == READY and auto:
+        if status == READY and auto and config.auto_register_allowed():
             await _apply_register(db, item_id, payload, maker_id)
 
 # ----------------------------------------------------------------------------------------------------
@@ -1022,13 +1034,20 @@ async def capture_job(job_id, files, records=None, workdir=None):
         async with session_scope() as db:
             if config.capture_days():                                      # 보관 기간이 지난 캡처 지우기
                 cutoff = _now() - timedelta(days=config.capture_days())
+                old = [imgstore.key_of(d) for d in (await db.execute(select(IntakeCapture.data).where(IntakeCapture.created_at < cutoff))).scalars().all()] if imgstore.enabled() else []
                 await db.execute(delete(IntakeCapture).where(IntakeCapture.created_at < cutoff))
+                if old: await asyncio.to_thread(imgstore.delete, old)
             job = await db.get(IntakeJob, job_id)
             if job is None: return
             status = (res or {}).get("status") or "failed"
             if res:
                 for cp in res["captures"]:
-                    db.add(IntakeCapture(job_id=job_id, file_name=cp["file"], page_no=cp["page"], mime=cp["mime"], data=cp["data"]))
+                    key = None
+                    if imgstore.enabled():
+                        try: key = await asyncio.to_thread(imgstore.put, cp["data"], cp["mime"])
+                        except Exception: logger.exception("쪽 캡처를 이미지 저장소에 올리지 못해 DB 에 둡니다: %s", job_id)
+                    db.add(IntakeCapture(job_id=job_id, file_name=cp["file"], page_no=cp["page"], mime=cp["mime"], data=imgstore.ref(key) if key else cp["data"]))
+                    cp["data"] = None                                             # 올린 쪽 바이트는 바로 버린다
                 for key, pages in res["map"].items():
                     it = (await db.execute(select(IntakeItem).where(IntakeItem.job_id == job_id, IntakeItem.source_key == key, IntakeItem.out_index == 0))).scalars().first()
                     if it is not None and it.record is not None: it.record = {**it.record, "캡처쪽": pages}
@@ -1049,14 +1068,17 @@ async def original_of(db, it):
     if pages:
         rows = (await db.execute(select(IntakeCapture).where(IntakeCapture.job_id == it.job_id, IntakeCapture.file_name.in_({p["file"] for p in pages})))).scalars().all()
         have = {(r.file_name, r.page_no): r for r in rows}
-        caps = [{"file": p["file"], "page": p["page"], "mime": have[(p["file"], p["page"])].mime, "b64": base64.b64encode(have[(p["file"], p["page"])].data).decode()}
-                for p in pages if (p["file"], p["page"]) in have]
+        def _cap(p):
+            r = have[(p["file"], p["page"])]
+            k = imgstore.key_of(r.data)
+            if k: return {"file": p["file"], "page": p["page"], "mime": r.mime, "url": imgstore.url(k, 3600)}      # 링크만 준다: 브라우저가 직접 받는다
+            return {"file": p["file"], "page": p["page"], "mime": r.mime, "b64": base64.b64encode(r.data).decode()}
+        caps = [_cap(p) for p in pages if (p["file"], p["page"]) in have]
     job = await db.get(IntakeJob, it.job_id)
     cstat = ((job.options or {}).get("capture") or {}).get("status") if job else None
     capture_status = "ready" if caps else ("pending" if (config.capture() and not cstat and rec.get("원본형식") in ("PDF", "워드", "파워포인트", "한글")) else (cstat or "none"))
     return {"item_id": it.item_id, "captures": caps, "capture_status": capture_status, "kind": rec.get("입력종류"), "format": rec.get("원본형식") or rec.get("표형식"), "page": rec.get("page"),
             "text": rec.get("원본조각"), "fields": rec.get("fields"),
-            "images": [{"n": g.get("n"), "mime": g.get("mime"), "b64": g.get("b64")} for g in (rec.get("이미지") or []) if isinstance(g, dict)],
             "answer_material": rec.get("정답자료"),                         # 교수님 풀이(정답): 교수용 화면에만 보여야 한다
             "split": rec.get("방식분할"), "whole_doc": bool(rec.get("문서전체")), "memo": (rec.get("intake") or {}).get("메모") or []}
 

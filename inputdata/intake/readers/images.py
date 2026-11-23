@@ -1,5 +1,6 @@
 """문서 속 그림을 AI 에 보낼 수 있는 모양으로 준비한다."""
 import base64, io, os, zipfile, zlib
+from . import imgstore
 
 MAX_IMAGES = 8                 # 한 문제에 붙일 그림 수
 MAX_SIDE = 1600                # 긴 변 픽셀 (글자를 읽을 수 있는 크기)
@@ -73,7 +74,7 @@ def shrink(att, side=900, keep=4):
     for im in att[:keep]:
         try:
             from PIL import Image
-            raw = Image.open(io.BytesIO(base64.b64decode(im["b64"]))); raw.load()
+            raw = Image.open(io.BytesIO(imgstore.bytes_of(im))); raw.load()          # 키(MinIO)이든 b64 이든 읽는다. 줄인 그림은 잠깐 쓰고 버리므로 b64 로 둔다
             raw.thumbnail((side, side))
             buf = io.BytesIO(); raw.save(buf, "PNG", optimize=True)
             out.append({"n": im["n"], "mime": "image/png", "b64": base64.b64encode(buf.getvalue()).decode("ascii")})
@@ -87,14 +88,27 @@ def attach(blobs):
     out, notes, total = [], [], 0
     for i, blob in enumerate(blobs, 1):
         if blob is None: continue
+        kind = None
+        if isinstance(blob, tuple): blob, kind = blob                     # (바이트, 종류): 종류는 "원본그림"(문서 속 그림 그대로) | "쪽화면"(쪽 전체 화면)
+        if blob is None: continue
         p = prepare(blob)
         if p is None:
             notes.append(f"[이미지] {i}번은 AI 가 읽을 수 없는 형식이라 붙이지 못했습니다"); continue
         if len(out) >= MAX_IMAGES or total + len(p[1]) > MAX_TOTAL:
             notes.append(f"[이미지] {i}번은 그림이 너무 많거나 커서 붙이지 못했습니다"); continue
         total += len(p[1])
-        out.append({"n": i, "mime": p[0], "b64": base64.b64encode(p[1]).decode("ascii")})
+        if imgstore.enabled():                                  # MinIO 에 올리고 레코드에는 키만 남긴다 (바이트는 바로 버림)
+            try:
+                out.append({"n": i, "mime": p[0], "key": imgstore.put(p[1], p[0]), "size": len(p[1]), **({"종류": kind} if kind else {})}); continue
+            except Exception:
+                notes.append(f"[이미지] {i}번을 이미지 저장소에 올리지 못해 붙이지 못했습니다"); total -= len(p[1]); continue
+        out.append({"n": i, "mime": p[0], "b64": base64.b64encode(p[1]).decode("ascii"), "size": len(p[1]), **({"종류": kind} if kind else {})})
     return out, notes
+
+
+def weight(a):
+    """그림 항목이 작업 용량 한도에서 차지하는 크기."""
+    return a.get("size") or len(a.get("b64") or "")
 
 
 def job_budget():

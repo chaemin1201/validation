@@ -20,6 +20,24 @@ def _flag(name, default="off"):
     return os.environ.get(name, default).strip().lower() in ("on", "1", "true", "yes")
 
 
+def allowed_exts():
+    """업로드로 받는 확장자. 기본은 엑셀(.xlsx .xlsm)·.csv·.pdf 만. 다른 형식을 읽는 코드는 그대로 두었으므로 INTAKE_FORMATS 로 다시 열 수 있다.
+    예: INTAKE_FORMATS=xlsx,csv,pdf,docx,hwpx   /   INTAKE_FORMATS=all (읽을 수 있는 모든 형식)"""
+    v = os.environ.get("INTAKE_FORMATS", "xlsx,xlsm,csv,pdf").strip().lower()
+    if v == "all": return None
+    return tuple("." + x.strip().lstrip(".") for x in v.split(",") if x.strip())
+
+
+def lecture_extra():
+    """문제 파일 안에 강의 설명이 함께 있을 때, 그 설명에서 새로 만드는 문제 수 (기본 3, 1~10). INTAKE_LECTURE_EXTRA. 0 이면 만들지 않는다."""
+    return max(0, min(10, _int("INTAKE_LECTURE_EXTRA", 3)))
+
+
+def auto_register_allowed():
+    """검사를 통과한 문제를 승인 없이 바로 등록해도 되는지. 기본은 끔: 모든 문제는 사람이 확인·승인한 뒤 등록된다. INTAKE_AUTO_REGISTER=1 이면 업로드 때 고른 auto_register 값을 따른다."""
+    return str(os.environ.get("INTAKE_AUTO_REGISTER", "")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def exec_enabled():
     """정답 코드를 서버에서 실행해 검증할지. AI 가 쓴 코드를 실행하므로 기본은 끔(off)."""
     return _flag("INTAKE_EXEC") and _flag("INTAKE_EXEC_ISOLATED")

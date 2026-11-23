@@ -59,7 +59,7 @@ async def _read_uploads(files):
         for f in files:
             k = parsing.kind_of(f.filename or "")
             if not k:
-                raise HTTPException(status_code=400, detail=f"지원하지 않는 파일 형식입니다: {os.path.basename(f.filename or '')} (표 .xlsx/.csv/.db(SQLite), 원본 .pdf/.docx/.pptx/.hwp/.hwpx/.txt/.md)")
+                raise HTTPException(status_code=400, detail=f"지원하지 않는 파일 형식입니다: {os.path.basename(f.filename or '')} (받을 수 있는 형식: {', '.join(config.allowed_exts()) if config.allowed_exts() else '모든 읽기 형식'})")
             ext = os.path.splitext(f.filename)[1].lower()
             path = os.path.join(d, f"f{len(blobs)}{ext}"); size = 0
             with open(path, "wb") as out:

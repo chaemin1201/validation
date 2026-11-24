@@ -98,9 +98,11 @@ def jpeg_of(pdf, page, dpi=100, n_pages=None):
     return buf.getvalue()
 
 
-def capture(files, records, max_pages=40, dpi=100, render=None):
-    """files: [(표시 이름, 확장자(.docx), 바이트)], records: 문제 레코드 목록. render 는 시험용으로 jpeg_of 를 바꿔 끼우는 자리."""
+def capture(files, records, max_pages=40, dpi=100, render=None, sink=None):
+    """files: [(표시 이름, 확장자(.docx), 바이트)], records: 문제 레코드 목록. render 는 시험용으로 jpeg_of 를 바꿔 끼우는 자리.
+    sink(file_idx, page, jpg_bytes) -> {"key","size"} | None: (2026-11-22) 주면 쪽 그림을 만들자마자 넘기고 바이트는 버린다(captures 에는 메타만). None/예외면 그 쪽은 건너뛴다(캡처 목록·map 에서 제외)."""
     render = render or jpeg_of
+    idx_of = {label: i for i, (label, _e, _d) in enumerate(files)}
     unsupported, docs = [], []
     with tempfile.TemporaryDirectory() as d:
         for i, (label, ext, data) in enumerate(files):
@@ -137,9 +139,17 @@ def capture(files, records, max_pages=40, dpi=100, render=None):
             pdf, n = pdfs[label]
             jpg = render(pdf, page, dpi, n)
             if not jpg: continue
+            entry = {"file": label, "page": page, "mime": "image/jpeg"}
+            if sink is not None:
+                try: meta = sink(idx_of.get(label, 0), page, jpg)
+                except Exception: meta = None
+                if not meta: continue                                  # 업로드 실패: 이 쪽만 건너뜀
+                entry.update(meta); del jpg
+            else:
+                entry["data"] = jpg
             per_file[label] = per_file.get(label, 0) + 1
             done[(label, page)] = True
-            captures.append({"file": label, "page": page, "mime": "image/jpeg", "data": jpg})
+            captures.append(entry)
     mp = {}
     for key, ks in rec_pages.items():
         got = [{"file": f, "page": p} for f, p in ks if done.get((f, p))]

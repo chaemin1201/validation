@@ -40,13 +40,13 @@ ALLOWED_FIELDS_MAP: Dict[str, set[str]] = {
 }
 
 def _as_list(v: Any) -> list:
-    if v is None: 
+    if v is None:
         return []
-    if isinstance(v, list): 
+    if isinstance(v, list):
         return v
     if isinstance(v, str):
         s = v.strip()
-        if not s: 
+        if not s:
             return []
         try:
             p = json.loads(s)
@@ -76,39 +76,35 @@ async def create_problem(db: AsyncSession, problem_data, maker_id: str, dedupe_t
     problem_type_enum = getattr(problem_data, "problemType", None)
     if not problem_type_enum:
         raise HTTPException(status_code=400, detail="문제 유형이 지정되지 않았습니다.")
-    
+
     # Enum 값을 문자열로 변환
     # use_enum_values=True 설정이 있어도 안전하게 처리
     problem_type: str = (
-        problem_type_enum.value 
-        if hasattr(problem_type_enum, 'value') 
+        problem_type_enum.value
+        if hasattr(problem_type_enum, 'value')
         else str(problem_type_enum)
     )
-    
+
     if problem_type not in PROBLEM_MODEL_MAP:
         raise HTTPException(status_code=400, detail=f"지원하지 않는 문제 유형: {problem_type}")
-    
+
     model_cls = PROBLEM_MODEL_MAP[problem_type]
     allowed = ALLOWED_FIELDS_MAP[problem_type]
 
     # 2) dict 추출 (Pydantic v2 호환)
-    # try:
-    #     raw: Dict[str, Any] = problem_data.model_dump()
-    # except AttributeError:
-    #     raw = problem_data.dict()
     raw: Dict[str, Any] = problem_data.model_dump(mode="json")      # Enum을 문자열 값으로 변환
 
     # 3) 화이트리스트 필터
     data: Dict[str, Any] = {k: v for k, v in raw.items() if k in allowed}
 
     # 4) 공통 배열 보정
-    if "tags" in allowed: 
+    if "tags" in allowed:
         data["tags"] = _as_list(data.get("tags"))
-    if "problem_condition" in allowed: 
+    if "problem_condition" in allowed:
         data["problem_condition"] = _as_list(data.get("problem_condition"))
-    if "test_cases" in allowed: 
+    if "test_cases" in allowed:
         data["test_cases"] = _as_list(data.get("test_cases"))
-    if "grading_criteria" in allowed: 
+    if "grading_criteria" in allowed:
         data["grading_criteria"] = _as_list(data.get("grading_criteria"))
 
     # 5) 타입별 정책
@@ -183,6 +179,8 @@ async def create_problem(db: AsyncSession, problem_data, maker_id: str, dedupe_t
         async with db.begin_nested():       # 중복 인덱스 위반 시 이 저장만 되돌리고 세션은 계속 쓴다
             db.add(problem_obj)
             await db.flush()
+            from app.rag.services.service import on_problem_saved as _rag_on_saved   # (2026-11-21 B6) RAG_ENABLED 면 임베딩, 꺼져 있으면 즉시 반환
+            await _rag_on_saved(db, problem_obj)
         return problem_obj
 
     except IntegrityError as e:
@@ -192,7 +190,7 @@ async def create_problem(db: AsyncSession, problem_data, maker_id: str, dedupe_t
                 Problem.maker_id == maker_id, Problem.temporary_field_str_2 == content_hash,
                 Problem.is_deleted.is_(False)).limit(1))
             raise DuplicateProblemError(existing_id, content_hash)
-        if "uq_problem_title_code" in msg or "problem.title" in msg:           # 등록 제목 코드(PY41_0007)가 겹침: 중복 문제가 아니라 번호 충돌이므로 호출한 쪽이 새 번호로 다시 시도한다
+        if "uq_problem_tenant_title_code" in msg or "uq_problem_title_code" in msg or "problem.title" in msg:   # 등록 제목 코드(PY41_0007)가 겹침(운영 인덱스 이름은 uq_problem_tenant_title_code): 중복 문제가 아니라 번호 충돌이므로 호출한 쪽이 새 번호로 다시 시도한다
             raise TitleTakenError(str(data.get("title")))
         # await db.rollback()       # 세션 전체를 롤백 -> 성공한 문제들도 날아감
         logger.error("문제 저장 무결성 오류: %s", e.orig)   # 서버에서 오류 원인을 알려줌(오류날 때 DB구조를 프론트 노출 방지)

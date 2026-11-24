@@ -1,14 +1,20 @@
 # app/inputdata/intake/models.py
-"""업로드 작업(IntakeJob)과 그 결과 항목(IntakeItem). 서버 DB 에 새 테이블 2개가 생긴다."""
+"""업로드 작업(IntakeJob)과 그 결과 항목(IntakeItem). 서버 DB 에 새 테이블 4개가 생긴다.
+
+멀티테넌시(backend-plan 섹션 14 ④): 이 표들은 전부 maker_id(사용자)에 매여 있는 기관별 데이터이므로
+TenantMixin 을 상속한다. 상속하지 않으면 app/tenant/filter.py 의 verify_tenant_models() 가
+서버 시작을 막는다.
+"""
 import json
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, LargeBinary, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, LargeBinary, PrimaryKeyConstraint, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
 from app.database import Base
+from app.tenant.filter import TenantMixin
 
 JsonType = JSON().with_variant(JSONB(), "postgresql")
 
@@ -31,14 +37,19 @@ EDITABLE = {READY, NEEDS_REVIEW, NEEDS_INPUT, BLOCKED, HELD, REGISTER_FAILED}
 ALL_STATUS = [PENDING, PROCESSING, AI_FAILED, READY, NEEDS_REVIEW, NEEDS_INPUT, BLOCKED, HELD, REGISTERED, DUPLICATE, REGISTER_FAILED, SKIPPED]
 
 
-class ProblemTitleSeq(Base):
-    """등록 제목 코드의 접두(PY41)별 마지막으로 준 번호. 번호는 이 표의 한 줄을 +1 해서 받으므로 서버가 여러 개여도 겹치지 않는다."""
+class ProblemTitleSeq(TenantMixin, Base):
+    """등록 제목 코드의 접두(PY41)별 마지막으로 준 번호. 번호는 이 표의 한 줄을 +1 해서 받으므로 서버가 여러 개여도 겹치지 않는다.
+
+    기관(tenant)별로 번호를 따로 센다 (PK가 (tenant, prefix) 복합키). 그렇지 않으면 서로 다른 기관이
+    같은 접두(PY41)로 같은 번호(PY41_0001)를 받아 problem.title 의 유니크 인덱스에서 충돌한다.
+    """
     __tablename__ = "problem_title_seq"
-    prefix: Mapped[str] = mapped_column(String(40), primary_key=True)
+    prefix: Mapped[str] = mapped_column(String(40))
     last_no: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    __table_args__ = (PrimaryKeyConstraint("tenant", "prefix", name="pk_problem_title_seq"),)
 
 
-class IntakeJob(Base):
+class IntakeJob(TenantMixin, Base):
     __tablename__ = "intake_job"
 
     job_id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -54,7 +65,7 @@ class IntakeJob(Base):
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)   # 처리 중인 워커가 문제마다 갱신
 
 
-class IntakeCapture(Base):
+class IntakeCapture(TenantMixin, Base):
     """원본 캡처: 올린 문서의 쪽 이미지(JPEG). 승인 화면 왼쪽에 원본을 그대로 보여 주는 데 쓰고, 보관 기간(기본 30일)이 지나면 지운다."""
     __tablename__ = "intake_capture"
 
@@ -63,11 +74,13 @@ class IntakeCapture(Base):
     file_name: Mapped[str] = mapped_column(String, nullable=False)
     page_no: Mapped[int] = mapped_column(Integer, nullable=False)
     mime: Mapped[str] = mapped_column(String(40), nullable=False, default="image/jpeg")
-    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)                 # (2026-11-22 커밋 3) INTAKE_IMAGE_STORE=minio 면 NULL, 대신 object_key
+    object_key: Mapped[str | None] = mapped_column(String, nullable=True)                  # MinIO intake 버킷 key ({tenant}/{job_id}/cap/{file_idx}_{page}.jpg). SQL: docs/sql/2026-11-22_intake_minio.sql
+    size: Mapped[int | None] = mapped_column(Integer, nullable=True)                       # 바이트 수(객체 저장 시)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), nullable=False, index=True)
 
 
-class IntakeItem(Base):
+class IntakeItem(TenantMixin, Base):
     __tablename__ = "intake_item"
 
     item_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

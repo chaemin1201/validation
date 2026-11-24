@@ -22,12 +22,14 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from app.problem.models.problem import Problem
 
 from app.database import get_db
+from app.tenant.context import get_current_tenant
 from app.inputdata.dedupe import DuplicateProblemError, TitleTakenError, compute_content_hash
 from app.inputdata.schemas import format_validation_errors, problem_adapter
 from ..crud.inputdata import create_problem
 from . import config, llm
 from .checks import checker, pipeline
 from .readers import images as images_mod, capture as capture_mod, imgstore
+from . import blobstore                                            # (2026-11-22 커밋 3) 캡처·문서 그림 MinIO 저장(INTAKE_IMAGE_STORE=minio)
 from .models import (EDITABLE, IntakeCapture, ProblemTitleSeq, extras, unwrap as unwrap_description, wrap as wrap_description, AI_FAILED, APPROVABLE, BLOCKED, DUPLICATE, HELD, NEEDS_INPUT, NEEDS_REVIEW, PENDING, PROCESSING,
                      READY, REGISTER_FAILED, REGISTERED, IntakeItem, IntakeJob)
 from .llm import parse_lines
@@ -94,25 +96,47 @@ def _alive(job):
 
 # ---------------------------------------------------------------- 작업 만들기
 async def delete_jobs(db, job_ids):
-    """작업과 그 항목·캡처를 지운다 (등록된 문제는 그대로). 지운 작업 수."""
+    """작업과 그 항목·캡처를 지운다 (등록된 문제는 그대로). 지운 작업 수.
+    (2026-11-22) MinIO 에 객체가 있는 작업(options.blob)은 **객체를 먼저** 지우고 DB 를 지운다. 객체 삭제가 실패하면 그 작업의 행은 남기고 경고만 남긴다
+    (DB 만 지워 객체가 고아가 되는 일이 없게). 남은 것은 다음 삭제 시도나 `python -m app.inputdata.intake.gc` 가 정리한다."""
     ids = list(job_ids)
     if not ids: return 0
-    keys = await _image_keys(db, ids)
-    await db.execute(delete(IntakeCapture).where(IntakeCapture.job_id.in_(ids)))
-    await db.execute(delete(IntakeItem).where(IntakeItem.job_id.in_(ids)))
-    await db.execute(delete(IntakeJob).where(IntakeJob.job_id.in_(ids)))
+    rows = (await db.execute(select(IntakeJob.job_id, IntakeJob.tenant, IntakeJob.options).where(IntakeJob.job_id.in_(ids)))).all()
+    ok_ids = []
+    for jid, tenant, opts in rows:
+        if (opts or {}).get("blob"):
+            try:
+                n, failed = await blobstore.aremove_prefix(blobstore.job_prefix(tenant, jid))
+                if failed: raise RuntimeError(f"{len(failed)} objects not removed")
+            except Exception:
+                logger.warning("작업 %s 의 MinIO 객체 삭제 실패 — DB 행을 남겨 둔다(정리 스크립트 대상)", jid, exc_info=True)
+                continue
+        ok_ids.append(jid)
+    if not ok_ids: return 0
+    await db.execute(delete(IntakeCapture).where(IntakeCapture.job_id.in_(ok_ids)))
+    await db.execute(delete(IntakeItem).where(IntakeItem.job_id.in_(ok_ids)))
+    await db.execute(delete(IntakeJob).where(IntakeJob.job_id.in_(ok_ids)))
     await db.commit()
-    if keys: await asyncio.to_thread(imgstore.delete, keys)         # 이미지 저장소(MinIO)의 그림도 지운다. 못 지운 것은 저장소 수명 규칙이 지운다
-    return len(ids)
+    return len(ok_ids)
 
 
-async def _image_keys(db, job_ids):
-    """작업들이 MinIO 에 둔 그림 키 (문제에 붙인 그림 + 쪽 캡처)."""
-    if not imgstore.enabled(): return []
-    keys = [imgstore.key_of(d) for d in (await db.execute(select(IntakeCapture.data).where(IntakeCapture.job_id.in_(job_ids)))).scalars().all()]       # 쪽 캡처 중 MinIO 에 둔 것(키)
-    for rec in (await db.execute(select(IntakeItem.record).where(IntakeItem.job_id.in_(job_ids), IntakeItem.record.is_not(None)))).scalars().all():
-        if isinstance(rec, dict): keys += imgstore.keys_in(rec)
-    return keys
+async def expire_captures(db, cutoff):
+    """보관 기간이 지난 캡처 삭제 — 객체가 있는 행은 객체를 먼저 지우고, 못 지운 행은 남긴다."""
+    rows = (await db.execute(select(IntakeCapture.capture_id, IntakeCapture.object_key).where(IntakeCapture.created_at < cutoff))).all()
+    if not rows: return 0
+    keyed = {cid: k for cid, k in rows if k}
+    drop = [cid for cid, k in rows if not k]
+    if keyed:
+        try:
+            _n, failed = await blobstore.aremove_keys(keyed.values())
+            bad = set(failed)
+            drop += [cid for cid, k in keyed.items() if k not in bad]
+            if bad: logger.warning("만료 캡처 객체 %d개 삭제 실패 — 행을 남겨 둔다", len(bad))
+        except Exception:
+            logger.warning("만료 캡처 객체 삭제 실패 — 객체가 있는 행은 남겨 둔다", exc_info=True)
+    if drop:
+        await db.execute(delete(IntakeCapture).where(IntakeCapture.capture_id.in_(drop)))
+    return len(drop)
 
 
 async def purge_old_jobs(db):
@@ -135,8 +159,22 @@ async def create_job(db, maker_id, kind, file_names, records, mode, auto_registe
     db.add(IntakeJob(job_id=job_id, maker_id=maker_id, status=status, input_kind=kind, file_names=list(file_names),
                      options={"mode": mode, "auto_register": bool(auto_register), "files": plan, "content_hash": content_hash, "problems": problems, "queue_no": time.time_ns()}, records_total=len(records), heartbeat_at=_now()))
     await db.flush()
+    blob = False
+    if blobstore.enabled():                                          # (2026-11-22) 문서 속 그림을 MinIO 로 올리고 record 엔 key·크기만 남긴다 (실패한 그림은 b64 유지). /preview 는 이 함수를 거치지 않는다
+        tenant = get_current_tenant()
+        if tenant:
+            new_records = []
+            for i, rec in enumerate(records, 1):
+                if isinstance(rec, dict) and rec.get("이미지"):
+                    rec, n_ok, _n_bad = await asyncio.to_thread(blobstore.offload_record_images, rec, tenant, job_id, i)
+                    blob = blob or n_ok > 0
+                new_records.append(rec)
+            records = new_records
     for i, rec in enumerate(records, 1):
         db.add(IntakeItem(job_id=job_id, seq=i, out_index=0, source_key=str(rec["key"]), record=rec, status=PENDING))
+    if blob:
+        job = await db.get(IntakeJob, job_id)
+        job.options = {**(job.options or {}), "blob": True}
     await db.commit()
     return job_id
 
@@ -664,7 +702,7 @@ async def _handle(ctx, item_id):
                 if im: pipeline.IMAGE_GATE.leave()
                 _log_call(calls, rec.get("key"), why, time.time() - t0, info)
         try:
-            imgs = attached_images(rec); used = (rec, imgs)
+            imgs = await blobstore.load_images(attached_images(rec)); used = (rec, imgs)          # (2026-11-22) key 만 있는 그림은 MinIO 에서 읽어 b64 로(호출 동안만)
             try:
                 pre = prefetch.pop(item_id, None)
                 text = pre if pre is not None else await ask(rec, imgs)
@@ -772,7 +810,7 @@ async def _process(job_id, ai_fn):
                     recs = dict((await db.execute(select(IntakeItem.item_id, IntakeItem.record).where(IntakeItem.item_id.in_(todo)))).all())
                     for iid, r in list(recs.items()):                                        # 순서 정렬·캐시 데우기에는 그림 자체가 필요 없다: 크기만 남기고 base64 는 버려 작업 전체의 그림이 메모리에 한꺼번에 올라와 있지 않게 한다
                         if isinstance(r, dict) and r.get("이미지"):
-                            recs[iid] = {**{k: v for k, v in r.items() if k != "이미지"}, "이미지": [{"n": 0}], "_w": len(json.dumps(r["이미지"]))}
+                            recs[iid] = {**{k: v for k, v in r.items() if k != "이미지"}, "이미지": [{"n": 0}], "_w": blobstore.image_weight(r["이미지"])}
                 except Exception:
                     logger.exception("문제 입력 조회 실패(순서 정렬·캐시 데우기를 건너뜀)")
             warm = []
@@ -894,11 +932,16 @@ async def allocate_title(db, prefix):
     """등록 제목 'PY41_0007' 을 하나 예약한다: 접두별 카운터 표의 한 줄을 원자적으로 +1 (서버가 여러 개여도 같은 번호가 나가지 않는다)."""
     try:
         async with db.begin_nested():
-            exists = (await db.execute(select(ProblemTitleSeq.last_no).where(ProblemTitleSeq.prefix == prefix))).scalar()
+            # (2026-11-21 운영 반영) 기관(tenant)별 카운터 — PK 가 (tenant, prefix) 복합키라 ON CONFLICT 대상에 tenant 를 함께 적어야 한다
+            # (prefix 만 적으면 PostgreSQL 이 "no unique constraint matching ON CONFLICT" 로 거부해 매번 '가장 큰 번호 + 1' 대체 경로로 떨어진다).
+            tenant = get_current_tenant()
+            if tenant is None:
+                raise RuntimeError("기관(tenant) 컨텍스트 없이 등록 제목 번호를 발급할 수 없습니다.")
+            exists = (await db.execute(select(ProblemTitleSeq.last_no).where(ProblemTitleSeq.tenant == tenant, ProblemTitleSeq.prefix == prefix))).scalar()
             seed = 0 if exists is not None else await _max_existing(db, prefix)             # 처음 쓰는 접두만: 이미 등록된 가장 큰 번호에서 이어 간다
             name = db.sync_session.get_bind().dialect.name
-            ins = (pg_insert if name == "postgresql" else sqlite_insert)(ProblemTitleSeq).values(prefix=prefix, last_no=seed + 1)
-            ins = ins.on_conflict_do_update(index_elements=[ProblemTitleSeq.prefix], set_={"last_no": ProblemTitleSeq.last_no + 1}).returning(ProblemTitleSeq.last_no)
+            ins = (pg_insert if name == "postgresql" else sqlite_insert)(ProblemTitleSeq).values(tenant=tenant, prefix=prefix, last_no=seed + 1)
+            ins = ins.on_conflict_do_update(index_elements=[ProblemTitleSeq.tenant, ProblemTitleSeq.prefix], set_={"last_no": ProblemTitleSeq.last_no + 1}).returning(ProblemTitleSeq.last_no)
             n = (await db.execute(ins)).scalar_one()
     except Exception as e:                                                                  # 표가 없거나 이 DB 가 upsert 를 지원하지 않음
         logger.warning("제목 번호 카운터를 쓰지 못해 가장 큰 번호 + 1 로 대신합니다 (마이그레이션 필요): %s", type(e).__name__)
@@ -1018,11 +1061,19 @@ async def capture_job(job_id, files, records=None, workdir=None):
             async with session_scope() as db:
                 rows = (await db.execute(select(IntakeItem.record).where(IntakeItem.job_id == job_id, IntakeItem.record.is_not(None)))).scalars().all()
             records = [{k: v for k, v in r.items() if k != "이미지"} for r in rows if isinstance(r, dict)]
+        sink = None
+        if blobstore.enabled():                                      # (2026-11-22) 쪽 그림을 만들자마자 MinIO 로 올리고 바이트는 버린다. 실패한 쪽은 건너뜀
+            async with session_scope() as db:
+                tenant = (await db.execute(select(IntakeJob.tenant).where(IntakeJob.job_id == job_id))).scalar_one_or_none()
+            if tenant:
+                def sink(fidx, page, jpg):
+                    key = blobstore.cap_key(tenant, job_id, fidx, page)
+                    return {"key": key, "size": blobstore.put_bytes(key, jpg, "image/jpeg")}
         async with _CAPTURE_LOCK:
             def _read():
                 return [(n, e, open(d, "rb").read() if isinstance(d, str) else d) for n, e, d in files]
             def _go():
-                return capture_mod.capture(_read(), records, config.capture_pages(), config.capture_dpi())
+                return capture_mod.capture(_read(), records, config.capture_pages(), config.capture_dpi(), sink=sink)
             res = await asyncio.to_thread(_go)
     except Exception:
         logger.exception("원본 캡처 실패: %s", job_id)
@@ -1032,22 +1083,17 @@ async def capture_job(job_id, files, records=None, workdir=None):
             shutil.rmtree(workdir, ignore_errors=True)
     try:
         async with session_scope() as db:
-            if config.capture_days():                                      # 보관 기간이 지난 캡처 지우기
-                cutoff = _now() - timedelta(days=config.capture_days())
-                old = [imgstore.key_of(d) for d in (await db.execute(select(IntakeCapture.data).where(IntakeCapture.created_at < cutoff))).scalars().all()] if imgstore.enabled() else []
-                await db.execute(delete(IntakeCapture).where(IntakeCapture.created_at < cutoff))
-                if old: await asyncio.to_thread(imgstore.delete, old)
+            if config.capture_days():                                      # 보관 기간이 지난 캡처 지우기 (객체 → 행 순서)
+                await expire_captures(db, _now() - timedelta(days=config.capture_days()))
             job = await db.get(IntakeJob, job_id)
             if job is None: return
             status = (res or {}).get("status") or "failed"
             if res:
                 for cp in res["captures"]:
-                    key = None
-                    if imgstore.enabled():
-                        try: key = await asyncio.to_thread(imgstore.put, cp["data"], cp["mime"])
-                        except Exception: logger.exception("쪽 캡처를 이미지 저장소에 올리지 못해 DB 에 둡니다: %s", job_id)
-                    db.add(IntakeCapture(job_id=job_id, file_name=cp["file"], page_no=cp["page"], mime=cp["mime"], data=imgstore.ref(key) if key else cp["data"]))
-                    cp["data"] = None                                             # 올린 쪽 바이트는 바로 버린다
+                    db.add(IntakeCapture(job_id=job_id, file_name=cp["file"], page_no=cp["page"], mime=cp["mime"],
+                                         data=cp.get("data"), object_key=cp.get("key"), size=cp.get("size") or (len(cp["data"]) if cp.get("data") else None)))
+                if any(cp.get("key") for cp in res["captures"]):
+                    job.options = {**(job.options or {}), "blob": True}
                 for key, pages in res["map"].items():
                     it = (await db.execute(select(IntakeItem).where(IntakeItem.job_id == job_id, IntakeItem.source_key == key, IntakeItem.out_index == 0))).scalars().first()
                     if it is not None and it.record is not None: it.record = {**it.record, "캡처쪽": pages}
@@ -1055,6 +1101,35 @@ async def capture_job(job_id, files, records=None, workdir=None):
             await db.commit()
     except Exception:
         logger.exception("원본 캡처 저장 실패: %s", job_id)
+
+async def _b64_of(data=None, key=None):
+    if data: return base64.b64encode(data).decode()
+    if key:
+        try: return base64.b64encode(await blobstore.aget_bytes(key)).decode()
+        except Exception: logger.warning("이미지 읽기 실패(b64 생략) key=%s", key, exc_info=True)
+    return None
+
+
+async def _capture_out(row, p):
+    """captures[] 한 항목: url(객체가 있을 때, 서명·단기) + b64(INTAKE_INLINE_B64=on 이거나 객체가 없는 옛 행)."""
+    out = {"file": p["file"], "page": p["page"], "mime": row.mime, "url": None, "b64": None}
+    if row.object_key:
+        out["url"] = await blobstore.apresign(row.object_key)
+        if blobstore.inline_b64(): out["b64"] = await _b64_of(key=row.object_key)
+    else:
+        out["b64"] = await _b64_of(data=row.data)                      # 옛 행(bytea): url 없음
+    return out
+
+
+async def _image_out(g):
+    out = {"n": g.get("n"), "mime": g.get("mime"), "url": None, "b64": None}
+    if g.get("key"):
+        out["url"] = await blobstore.apresign(g["key"])
+        if blobstore.inline_b64(): out["b64"] = await _b64_of(key=g["key"])
+    else:
+        out["b64"] = g.get("b64")                                       # 옛 record(b64 인라인) 또는 업로드 실패분
+    return out
+
 
 async def original_of(db, it):
     """승인 화면 왼쪽 패널용: 이 문제 하나의 원본(글·엑셀 열·그림)만 준다. 목록(with_record)보다 가볍고 필요한 것만 담는다."""
@@ -1066,19 +1141,19 @@ async def original_of(db, it):
     pages = rec.get("캡처쪽") or []
     caps = []
     if pages:
-        rows = (await db.execute(select(IntakeCapture).where(IntakeCapture.job_id == it.job_id, IntakeCapture.file_name.in_({p["file"] for p in pages})))).scalars().all()
+        from sqlalchemy import or_, and_, tuple_
+        want = {(p["file"], int(p["page"])) for p in pages if "file" in p and "page" in p}
+        rows = (await db.execute(select(IntakeCapture).where(IntakeCapture.job_id == it.job_id,
+                                                              tuple_(IntakeCapture.file_name, IntakeCapture.page_no).in_(list(want)) if want else False))).scalars().all()   # 필요한 (파일, 쪽)만 읽는다 — 파일의 모든 쪽(수십 장 bytea)을 올리지 않음
         have = {(r.file_name, r.page_no): r for r in rows}
-        def _cap(p):
-            r = have[(p["file"], p["page"])]
-            k = imgstore.key_of(r.data)
-            if k: return {"file": p["file"], "page": p["page"], "mime": r.mime, "url": imgstore.url(k, 3600)}      # 링크만 준다: 브라우저가 직접 받는다
-            return {"file": p["file"], "page": p["page"], "mime": r.mime, "b64": base64.b64encode(r.data).decode()}
-        caps = [_cap(p) for p in pages if (p["file"], p["page"]) in have]
+        caps = [await _capture_out(have[(p["file"], p["page"])], p) for p in pages if (p["file"], p["page"]) in have]
     job = await db.get(IntakeJob, it.job_id)
     cstat = ((job.options or {}).get("capture") or {}).get("status") if job else None
     capture_status = "ready" if caps else ("pending" if (config.capture() and not cstat and rec.get("원본형식") in ("PDF", "워드", "파워포인트", "한글")) else (cstat or "none"))
     return {"item_id": it.item_id, "captures": caps, "capture_status": capture_status, "kind": rec.get("입력종류"), "format": rec.get("원본형식") or rec.get("표형식"), "page": rec.get("page"),
             "text": rec.get("원본조각"), "fields": rec.get("fields"),
+            "images": [await _image_out(g) for g in (rec.get("이미지") or []) if isinstance(g, dict)],
+            "url_expires_in": blobstore.signed_minutes() * 60,            # (2026-11-22) url 유효 시간(초). url 은 이 요청(소유자 검사 통과)에만 발급된 서명 URL
             "answer_material": rec.get("정답자료"),                         # 교수님 풀이(정답): 교수용 화면에만 보여야 한다
             "split": rec.get("방식분할"), "whole_doc": bool(rec.get("문서전체")), "memo": (rec.get("intake") or {}).get("메모") or []}
 

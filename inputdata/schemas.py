@@ -149,7 +149,7 @@ class CodingProblemRequest(ProblemBaseRequest):
     def check_gradable(self):
         _check_gradable(self.test_cases, self.problem_condition)
         return self
-    
+
     @field_validator("test_cases", mode="before")
     @classmethod
     def validate_test_cases(cls, v):
@@ -184,7 +184,7 @@ class DebuggingProblemRequest(ProblemBaseRequest):
         if v is None:
             return []
         return v if isinstance(v, list) else [v]
-    
+
     @field_validator("test_cases", mode="before")
     @classmethod
     def validate_test_cases(cls, v):
@@ -205,7 +205,7 @@ class MultipleChoiceRequest(ProblemBaseRequest):
     rating_mode: MultipleChoiceRatingModeEnum = MultipleChoiceRatingModeEnum.none
     options: List[str] = Field(min_length=2)
     correct_answers: List[int] = Field(min_length=1)
-    
+
     @field_validator("options", mode="before")
     @classmethod
     def validate_options(cls, v):
@@ -268,8 +268,8 @@ class MultipleChoiceRequest(ProblemBaseRequest):
 class ShortAnswerProblemRequest(ProblemBaseRequest):
     problemType: Literal["단답형"]
     rating_mode: ShortAnswerRatingModeEnum = ShortAnswerRatingModeEnum.none
-    answer_text: Union[List[str], dict[str, List[str]]] 
-    
+    answer_text: Union[List[str], dict[str, List[str]]]
+
     # @field_validator("answer_text", mode="before")
     # @classmethod
     # def validate_answer_text(cls, v):
@@ -291,7 +291,7 @@ class ShortAnswerProblemRequest(ProblemBaseRequest):
     def normalize_answer_text(cls, v):
         if v is None:
             return []
-        if isinstance(v, str):                
+        if isinstance(v, str):
             s = v.strip()
             return [s] if s else []
         return v
@@ -313,7 +313,7 @@ class SubjectiveProblemRequest(ProblemBaseRequest):
     problemType: Literal["주관식"]
     rating_mode: SubjectiveRatingModeEnum = SubjectiveRatingModeEnum.deactive
     answer_text: str = Field(min_length=1)
-    
+
     @field_validator("answer_text", mode="before")
     @classmethod
     def validate_answer_text(cls, v):
@@ -329,13 +329,6 @@ class SubjectiveProblemRequest(ProblemBaseRequest):
         return str(v)
 
 # --------- Union Type ---------
-# ProblemRequestUnion = Union[
-#     CodingProblemRequest,
-#     DebuggingProblemRequest,
-#     MultipleChoiceRequest,
-#     ShortAnswerProblemRequest,
-#     SubjectiveProblemRequest,
-# ]
 # problemType으로 빠르게 분류
 ProblemRequestUnion = Annotated[
     Union[
@@ -351,9 +344,6 @@ ProblemRequestUnion = Annotated[
 problem_adapter = TypeAdapter(ProblemRequestUnion)      # 딕셔너리로 저장된 문제들을 검사
 
 # --------- Input Data Request ---------
-# class InputDataRequest(BaseModel):
-#     model_config = ConfigDict(use_enum_values=True)
-#     problems: List[ProblemRequestUnion]
 class InputDataRequest(BaseModel):
     # 개별 검증은 라우터에서 건별로 수행
     problems: List[dict[str, Any]] = Field(min_length=1, max_length=500)        # 여러 문제를 딕셔너리로 저장

@@ -23,7 +23,7 @@ def _flag(name, default="off"):
 def allowed_exts():
     """업로드로 받는 확장자. 기본은 엑셀(.xlsx .xlsm)·.csv·.pdf 만. 다른 형식을 읽는 코드는 그대로 두었으므로 INTAKE_FORMATS 로 다시 열 수 있다.
     예: INTAKE_FORMATS=xlsx,csv,pdf,docx,hwpx   /   INTAKE_FORMATS=all (읽을 수 있는 모든 형식)"""
-    v = os.environ.get("INTAKE_FORMATS", "xlsx,xlsm,csv,pdf").strip().lower()
+    v = (os.environ.get("INTAKE_FORMATS") or "xlsx,xlsm,csv,pdf").strip().lower()          # 빈 값(compose 에서 값 없이 둔 경우)은 기본값으로 — 빈 튜플이 되면 모든 형식이 거절된다
     if v == "all": return None
     return tuple("." + x.strip().lstrip(".") for x in v.split(",") if x.strip())
 

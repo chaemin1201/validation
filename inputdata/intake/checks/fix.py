@@ -1983,11 +1983,23 @@ _LANG_CODE = {"python": "PY", "py": "PY", "java": "JAVA", "c": "C", "cpp": "CPP"
 _ID_HEAD = re.compile(r"^\s*(?:문제\s*)?([A-Za-z][A-Za-z+#]*)[\s_-]*(\d{1,3})(?:[\s_-]+\d{1,4})?(?=[\s_\-.:]|$)")
 
 
+def _file_derived_id(rec, orig):
+    """(2026-11-22) 서버가 파일 이름으로 만든 문제 ID 인가 — '<파일 stem>_<순번 2자리 이상>' (방식 분할 '-2' 꼬리 허용). 이 숫자는 주제 번호가 아니다.
+    문서에 문제 ID(PY41-0001)가 없을 때 readers 가 file_stem(파일)+'_%02d' 로 붙인 것이라, 파일 'problems.txt' 의 'problems_01'·'big36_02' 가 해당한다."""
+    label = (rec or {}).get("파일")
+    if not label or not orig: return False
+    from ..readers import pdf_intake
+    stem = pdf_intake.file_stem(str(label))
+    return bool(stem) and re.fullmatch(re.escape(stem) + r"_\d{2,}(?:[\s_-]+\d{1,4})?", orig, re.I) is not None
+
+
 def title_info(rec, payload):
-    """등록 제목 정보. {"코드접두": "PY41", "등록제목": "PY41_(순번)", "원래이름": 입력의 제목, "읽을이름": 부제목이 될 이름('' 이면 없음), "주제번호확실": bool}."""
+    """등록 제목 정보. {"코드접두": "PY41", "등록제목": "PY41_(순번)", "원래이름": 입력의 제목, "읽을이름": 부제목이 될 이름('' 이면 없음), "주제번호확실": bool}.
+    (2026-11-22) 파일 이름에서 온 ID('problems_01')의 숫자는 주제 번호로 쓰지 않는다 → 언어만 있으면 'PY0', 언어도 모르면 'ETC0'. 파일 이름은 부제목으로도 쓰지 않는다."""
     exp, pt = expected_title(rec), str((payload or {}).get("title") or "").strip()
     orig = (pt if (pt and exp and pt.startswith(exp)) else (exp or pt)).strip()          # 방식 분할 문제는 'PY41-0001-2' 처럼 그 문제의 제목
-    m = _ID_HEAD.match(orig)
+    file_id = _file_derived_id(rec, orig)
+    m = None if file_id else _ID_HEAD.match(orig)
     lang = ""
     for c in (payload or {}).get("reference_codes") or []:
         if isinstance(c, dict) and c.get("language"):
@@ -1997,10 +2009,10 @@ def title_info(rec, payload):
     sure_lang = bool(lang)
     lang = lang or "ETC"                                                         # 코드가 없는 유형(객관식 등)이고 언어 힌트도 없으면 언어를 알 수 없다
     # 주제 번호: ID 머리글 > '5주차'·'3장'·'단원 2' 처럼 주제를 가리키는 말 옆의 숫자. 파일 이름 뒤에 서버가 붙인 문제 번호(_02)는 주제 번호가 아니다
-    wk = None if m else re.search(r"(\d+)\s*(?:주차|장|단원|강|회차|챕터)|(?:chapter|week|unit)\s*(\d+)", orig, re.I)
+    wk = None if (m or file_id) else re.search(r"(\d+)\s*(?:주차|장|단원|강|회차|챕터)|(?:chapter|week|unit)\s*(\d+)", orig, re.I)
     num = m.group(2) if m else ((wk.group(1) or wk.group(2)) if wk else None)
     cat = str(int(num)) if num is not None else "0"
-    rest = orig[m.end():] if m else orig
+    rest = "" if file_id else (orig[m.end():] if m else orig)                        # 파일 이름 유래 ID 는 이름(부제목)으로도 쓰지 않는다
     rest = re.sub(r"^[\s_\-.:]+", "", rest).strip(" _-")
     rest = re.sub(r"[\s_\-]+\d{1,3}$", "", rest)                                  # 이름 끝의 순번(_02)은 이름이 아니다
     name = rest if re.search(r"[가-힣A-Za-z]{2,}", rest) and not re.fullmatch(r"[\d\s_\-]*", rest) else ""

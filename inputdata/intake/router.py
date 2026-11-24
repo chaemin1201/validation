@@ -48,6 +48,14 @@ def _cleanup(blobs):
             shutil.rmtree(os.path.dirname(b[2]), ignore_errors=True); return
 
 
+def _reject_if_memory_critical():
+    """(2026-11-21) 서버 메모리가 MemGuard 한도의 120% 를 넘으면 새 업로드를 받지 않는다 — 503 + Retry-After 30초.
+    pipeline.MemGuard 주석에 적힌 동작의 실제 구현. 한도(INTAKE_MEM_LIMIT_MB, 없으면 컨테이너 한도의 75%) 아래로 내려오면 바로 다시 받는다."""
+    if pipeline.MEM_GUARD.level() >= 2:
+        pipeline.MEM_GUARD.relieve()
+        raise HTTPException(status_code=503, detail="서버 메모리가 부족해 잠시 업로드를 받을 수 없습니다. 30초 뒤 다시 시도해 주세요.", headers={"Retry-After": "30"})
+
+
 async def _read_uploads(files):
     """올린 파일을 검사해 (표 위치, 원본 위치, [(이름, 확장자, 임시 파일 경로)]) 로. 작업 생성과 미리보기가 함께 쓴다.
     파일을 메모리에 통째로 읽지 않고 1MB 씩 임시 파일로 옮겨 쓴다(파일 3개가 한꺼번에 메모리를 차지하지 않음). 끝나면 _cleanup(blobs)."""
@@ -96,6 +104,7 @@ async def _parse_uploads(tables, originals, blobs, pattern, warnings=None):
 async def preview(current_user: Annotated[dict, Depends(get_current_user)], files: List[UploadFile] = File(...), pattern: Optional[str] = Form(None)):
     """AI 를 부르지 않고 파일을 문제로 나눈 결과만 보여 준다 (문제 수, 경계, 그림, 이상 징후). 작업을 만들지 않고 아무것도 저장하지 않는다."""
     _uid(current_user)
+    _reject_if_memory_critical()
     tables, originals, blobs = await _read_uploads(files)
     try:
         kind, records = await _parse_uploads(tables, originals, blobs, pattern)
@@ -110,6 +119,7 @@ async def create_job(background_tasks: BackgroundTasks, current_user: Annotated[
                      pattern: Optional[str] = Form(None), db: AsyncSession = Depends(get_db)):
     """엑셀(표) 하나 + 원본(PDF·워드·한글·txt·md) 여러 개 중 하나 이상을 올린다. 둘 다 올리면 서로 대조한다."""
     uid = _uid(current_user)
+    _reject_if_memory_critical()                                          # 메모리 한도의 120% 초과면 503 (파일을 받기 전에)
     tables, originals, blobs = await _read_uploads(files)                # 임시 파일로 받는다 (메모리에 올리지 않음)
     scheduled = False
     try:
@@ -244,7 +254,9 @@ async def delete_job(job_id: str, current_user: Annotated[dict, Depends(get_curr
     """작업 데이터(작업·항목·캡처)를 지운다. 등록된 문제는 그대로다. 처리 중인 작업은 지울 수 없다."""
     job = await _job(db, job_id, _uid(current_user))
     if job.status in ("processing", "queued") and service._alive(job): raise HTTPException(status_code=409, detail="처리 중인 작업은 지울 수 없습니다.")
-    await service.delete_jobs(db, [job_id])
+    n = await service.delete_jobs(db, [job_id])
+    if not n:                                              # (2026-11-22) MinIO 객체 삭제 실패 → DB 행을 남겼다(고아 객체 방지). 잠시 뒤 다시 시도
+        raise HTTPException(status_code=503, detail="이미지 저장소에서 객체를 지우지 못해 작업을 삭제하지 않았습니다. 잠시 뒤 다시 시도해 주세요.", headers={"Retry-After": "30"})
     return {"job_id": job_id, "deleted": True}
 
 
@@ -278,7 +290,7 @@ async def edit_item(item_id: int, body: EditRequest, current_user: Annotated[dic
 
 @router.get("/items/{item_id}/original")
 async def item_original(item_id: int, current_user: Annotated[dict, Depends(get_current_user)], db: AsyncSession = Depends(get_db)):
-    """승인 화면 왼쪽 패널: 이 문제의 원본 글·엑셀 열·그림 (그림은 base64)."""
+    """승인 화면 왼쪽 패널: 이 문제의 원본 글·엑셀 열·그림. (2026-11-22) 그림마다 url(서명, INTAKE_SIGNED_URL_MINUTES, 소유자 요청에만 발급)+b64(INTAKE_INLINE_B64=on)."""
     return await service.original_of(db, await _item(db, item_id, _uid(current_user)))
 
 
